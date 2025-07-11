@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Data and model files (handled externally or via Git LFS if needed)
+*.csv
+*.npz
+*.h5
+*.pt
+*.onnx
+*.zip
+
+# Raw data and output folders
+data/
+outputs/
+venv/
