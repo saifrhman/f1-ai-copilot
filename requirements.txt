@@ -1,20 +1,78 @@
-# Core ML & Optimization
-torch
-scikit-learn
-xgboost
-bayesian-optimization
+# Core Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
 
-# F1 Telemetry
-fastf1
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+alembic==1.13.1
 
-# Data Handling
-pandas
-polars
+# Vector Database
+qdrant-client==1.7.0
 
-# Plotting
-matplotlib
-seaborn
+# AI/ML Libraries
+numpy==1.24.3
+pandas==2.1.4
+scikit-learn==1.3.2
+xgboost==2.0.2
+optuna==3.5.0
 
-# Config & Logging
-python-dotenv
-loguru
+# Computer Vision
+opencv-python==4.8.1.78
+ultralytics==8.0.196
+segment-anything==1.0
+
+# Audio Processing
+librosa==0.10.1
+soundfile==0.12.1
+
+# Natural Language Processing
+langchain==0.0.350
+langchain-openai==0.0.2
+openai==1.3.7
+transformers==4.35.2
+torch==2.1.1
+
+# Speech Recognition
+whisper==1.1.10
+speechbrain==0.5.16
+
+# Visualization
+matplotlib==3.8.2
+plotly==5.17.0
+seaborn==0.13.0
+
+# F1 Data
+fastf1==3.3.5
+
+# HTTP Client
+httpx==0.25.2
+requests==2.31.0
+
+# Caching
+redis==5.0.1
+
+# Environment and Configuration
+python-dotenv==1.0.0
+python-multipart==0.0.6
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Development
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+pre-commit==3.6.0
+
+# Jupyter
+jupyter==1.0.0
+ipykernel==6.27.1
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
