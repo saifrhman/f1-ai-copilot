@@ -1,1 +1,2 @@
-def dummy_strategy():\n    return 'Strategy module ready'
+def dummy_strategy():\n    
+return 'Strategy module ready'
