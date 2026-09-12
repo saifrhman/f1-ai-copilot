@@ -1,0 +1,37 @@
+name: Project integration tests
+
+on:
+  push:
+    branches:
+      - main
+      - fix/full-project-hardening
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  project-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install system audio dependency
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+      - name: Run RAG and project tests
+        run: python -m pytest -q tests/test_fia_rag_agent.py tests/test_project_modules.py
+
+  fia-official-source-discovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install downloader dependency
+        run: pip install requests==2.31.0
+      - name: Verify current FIA regulation links can be discovered
+        run: python scripts/fetch_fia_regulations.py --year 2026 --dry-run
