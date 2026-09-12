@@ -28,7 +28,6 @@ from core_modules.strategy_optimizer.strategy_engine import (
     generate_strategy,
 )
 
-
 app = FastAPI(
     title="F1 AI Copilot",
     description="Formula 1 analysis demo with strategy, FIA RAG, setup, telemetry and radio-analysis modules",
@@ -94,18 +93,13 @@ class SetupRequest(BaseModel):
 
 @app.get("/")
 async def root() -> Dict[str, Any]:
-    return {
-        "message": "F1 AI Copilot API",
-        "version": app.version,
-        "status": "operational",
-        "docs": "/docs",
-    }
+    return {"message": "F1 AI Copilot API", "version": app.version, "status": "operational", "docs": "/docs"}
 
 
 @app.get("/health")
 async def health_check() -> Dict[str, Any]:
     fia_status = get_fia_knowledge_base().status()
-    fia_ready = bool(fia_status.get("initialized"))
+    fia_ready = bool(fia_status.get("ready"))
     return {
         "status": "healthy" if fia_ready else "degraded",
         "version": app.version,
@@ -192,7 +186,12 @@ async def fia_rag_status() -> Dict[str, Any]:
 @app.post("/api/fia/query")
 async def query_fia_rules(request: FIAQueryRequest) -> Dict[str, Any]:
     try:
-        return query_fia_regulations_detailed(request.question)
+        result = query_fia_regulations_detailed(request.question)
+        if not result.get("grounded") and str(result.get("answer", "")).startswith("FIA RAG is unavailable:"):
+            raise HTTPException(status_code=503, detail=result["answer"])
+        return result
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
