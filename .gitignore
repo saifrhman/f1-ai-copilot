@@ -1,12 +1,22 @@
-# Python virtual environment
+# Local environments and secrets
+.venv/
 venv/
+.env
+.env.*
+!.env.example
 
 # Python cache and compiled files
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
+
+# Local vector database
+.qdrant/
 
 # Data and model files (handled externally or via Git LFS if needed)
 *.csv
@@ -16,7 +26,11 @@ __pycache__/
 *.onnx
 *.zip
 
-# Raw data and output folders
+# Raw third-party data and generated output
 data/
 outputs/
-venv/
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
