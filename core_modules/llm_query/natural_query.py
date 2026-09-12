@@ -117,12 +117,19 @@ class NaturalQueryProcessor:
         from core_modules.rule_checker.fia_rag_agent import query_fia_regulations_detailed
 
         result = query_fia_regulations_detailed(query)
+        if not result.get("grounded") and str(result.get("answer", "")).startswith("FIA RAG is unavailable:"):
+            raise RuntimeError(result["answer"])
         return QueryResult(
             answer=result["answer"],
             query_type=QueryType.REGULATORY,
             confidence=float(result.get("confidence", 0.0)),
             data_sources=["fia_regulations"],
-            additional_context={"citations": result.get("citations", []), "retrieved_passages": result.get("retrieved_passages", [])},
+            additional_context={
+                "citations": result.get("citations", []),
+                "retrieved_passages": result.get("retrieved_passages", []),
+                "top_retrieval_score": result.get("top_retrieval_score", 0.0),
+                "grounded": result.get("grounded", False),
+            },
         )
 
     @staticmethod
@@ -173,7 +180,8 @@ class NaturalQueryProcessor:
         for key, value in context["tire_data"].items():
             compound = TireCompound(key) if isinstance(key, str) else key
             item = dict(value)
-            item["compound"] = TireCompound(item.get("compound", compound.value)) if isinstance(item.get("compound", compound.value), str) else item["compound"]
+            raw_compound = item.get("compound", compound.value)
+            item["compound"] = TireCompound(raw_compound) if isinstance(raw_compound, str) else raw_compound
             item["peak_performance_window"] = tuple(item["peak_performance_window"])
             tyre_data[compound] = TireData(**item)
         competitors = []
@@ -197,7 +205,13 @@ class NaturalQueryProcessor:
             f"compounds {' -> '.join(c.value for c in best.tire_compounds)}, pit laps {best.pit_laps}, "
             f"projected remaining-race time {best.projected_race_time:.1f}s."
         )
-        return QueryResult(answer, QueryType.STRATEGY, best.confidence_score, ["strategy_engine"], {"strategy_id": best.strategy_id, "pit_laps": best.pit_laps})
+        return QueryResult(
+            answer,
+            QueryType.STRATEGY,
+            best.confidence_score,
+            ["strategy_engine"],
+            {"strategy_id": best.strategy_id, "pit_laps": best.pit_laps},
+        )
 
     @staticmethod
     def _handle_emotion_query(query: str, context: Dict[str, Any]) -> QueryResult:
