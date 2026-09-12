@@ -21,8 +21,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsndfile1
       - name: Install project dependencies
         run: pip install -r requirements.txt
+      - name: Compile Python source
+        run: python -m compileall -q app core_modules scripts tests
       - name: Run complete test suite
         run: python -m pytest -q
+      - name: Exercise strategy example
+        run: python -m core_modules.strategy_optimizer.example_usage
 
   fia-official-source-discovery:
     runs-on: ubuntu-latest
