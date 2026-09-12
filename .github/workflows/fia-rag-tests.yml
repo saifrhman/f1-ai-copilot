@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - fix/fia-rag-pipeline
     paths:
       - "core_modules/rule_checker/fia_rag_agent.py"
       - "tests/test_fia_rag_agent.py"
