@@ -13,7 +13,10 @@ import uvicorn
 from core_modules.strategy_optimizer.strategy_engine import (
     generate_strategy, DriverProfile, CarStatus, TireData, RaceState, Competitor
 )
-from core_modules.rule_checker.fia_rag_agent import query_fia_regulations
+from core_modules.rule_checker.fia_rag_agent import (
+    get_fia_knowledge_base,
+    query_fia_regulations_detailed,
+)
 from core_modules.rule_checker.penalty_predictor import predict_penalty
 from core_modules.llm_query.natural_query import process_natural_query
 from core_modules.driver_emotion.emotion_classifier import classify_emotion
@@ -82,7 +85,11 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "modules": ["strategy", "fia", "emotion", "ghost", "setup"]}
+    return {
+        "status": "healthy",
+        "modules": ["strategy", "fia", "emotion", "ghost", "setup"],
+        "fia_rag": get_fia_knowledge_base().status(),
+    }
 
 @app.post("/api/strategy/generate")
 async def generate_race_strategy(request: StrategyRequest):
@@ -94,15 +101,15 @@ async def generate_race_strategy(request: StrategyRequest):
         driver_profile = DriverProfile(**request.driver_profile)
         car_status = CarStatus(**request.car_status)
         race_state = RaceState(**request.race_state)
-        
+
         # Convert tire data
         tire_data = {}
         for compound, data in request.tire_data.items():
             tire_data[compound] = TireData(**data)
-        
+
         # Convert competition data
         competition = [Competitor(**comp) for comp in request.competition]
-        
+
         strategies = generate_strategy(
             telemetry=request.telemetry,
             car_status=car_status,
@@ -111,7 +118,7 @@ async def generate_race_strategy(request: StrategyRequest):
             race_state=race_state,
             competition=competition
         )
-        
+
         return {
             "strategies": [
                 {
@@ -132,14 +139,16 @@ async def generate_race_strategy(request: StrategyRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Strategy generation failed: {str(e)}")
 
+@app.get("/api/fia/status")
+async def fia_rag_status():
+    """Return configuration and indexing status for the FIA RAG component."""
+    return get_fia_knowledge_base().status()
+
 @app.post("/api/fia/query")
 async def query_fia_rules(request: FIAQueryRequest):
-    """
-    Query FIA regulations using RAG system
-    """
+    """Query FIA regulations and return answer plus retrieved evidence."""
     try:
-        answer = query_fia_regulations(request.question)
-        return {"answer": answer, "source": "fia_rag_agent"}
+        return query_fia_regulations_detailed(request.question)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"FIA query failed: {str(e)}")
 
@@ -212,4 +221,4 @@ async def recommend_car_setup(request: SetupRequest):
         raise HTTPException(status_code=500, detail=f"Setup recommendation failed: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)
