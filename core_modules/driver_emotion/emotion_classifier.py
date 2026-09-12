@@ -35,13 +35,24 @@ class EmotionResult:
 
 
 def _decode_audio_input(audio_input: str) -> Tuple[str, Optional[str]]:
-    """Return a filesystem path and an optional temporary path to clean up."""
+    """Return an audio path plus an optional temporary path to remove later."""
 
-    path = Path(audio_input)
-    if path.exists() and path.is_file():
-        return str(path), None
+    value = audio_input.strip()
+    if not value:
+        raise ValueError("audio_file cannot be empty")
 
-    payload = audio_input.strip()
+    # Raw base64 can be thousands of characters long. Do not pass such strings
+    # to pathlib.stat(), which can raise ENAMETOOLONG before we get a chance to
+    # decode them. Plausible filesystem paths are checked first.
+    if not value.startswith("data:") and len(value) <= 1024:
+        try:
+            path = Path(value)
+            if path.exists() and path.is_file():
+                return str(path), None
+        except OSError:
+            pass
+
+    payload = value
     suffix = ".wav"
     if payload.startswith("data:"):
         header, sep, payload = payload.partition(",")
@@ -58,7 +69,6 @@ def _decode_audio_input(audio_input: str) -> Tuple[str, Optional[str]]:
         decoded = base64.b64decode(payload, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError("audio_file must be an existing path or valid base64 audio") from exc
-
     if not decoded:
         raise ValueError("Decoded audio is empty")
 
@@ -81,20 +91,14 @@ class AudioFeatureExtractor:
         y, sr = librosa.load(audio_file, sr=self.sample_rate, mono=True)
         if y.size == 0:
             raise ValueError("Audio file contains no samples")
-
         duration = float(librosa.get_duration(y=y, sr=sr))
         if duration <= 0:
             raise ValueError("Audio duration must be positive")
 
         pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
         voiced = pitches[magnitudes > max(0.1, float(np.percentile(magnitudes, 75)))]
-        if voiced.size:
-            mean_pitch = float(np.mean(voiced))
-            pitch_std = float(np.std(voiced))
-        else:
-            mean_pitch = 0.0
-            pitch_std = 0.0
-
+        mean_pitch = float(np.mean(voiced)) if voiced.size else 0.0
+        pitch_std = float(np.std(voiced)) if voiced.size else 0.0
         rms = librosa.feature.rms(y=y)
         spectral = librosa.feature.spectral_centroid(y=y, sr=sr)
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
@@ -143,12 +147,7 @@ class EmotionClassifier:
         try:
             features = self.feature_extractor.extract_features(path)
             emotion, confidence = self._classify_from_features(features)
-            return EmotionResult(
-                emotion=emotion,
-                confidence=confidence,
-                duration=features.get("duration"),
-                audio_features=features,
-            )
+            return EmotionResult(emotion=emotion, confidence=confidence, duration=features.get("duration"), audio_features=features)
         finally:
             if temporary:
                 try:
@@ -167,25 +166,19 @@ class EmotionClassifier:
                 if minimum <= value <= maximum:
                     parts.append(1.0)
                 elif value < minimum:
-                    scale = max(abs(minimum), 1e-6)
-                    parts.append(max(0.0, 1.0 - (minimum - value) / scale))
+                    parts.append(max(0.0, 1.0 - (minimum - value) / max(abs(minimum), 1e-6)))
                 else:
-                    scale = max(abs(maximum), 1e-6)
-                    parts.append(max(0.0, 1.0 - (value - maximum) / scale))
+                    parts.append(max(0.0, 1.0 - (value - maximum) / max(abs(maximum), 1e-6)))
             if parts:
                 scores[emotion] = float(np.mean(parts))
 
         if not scores:
             return EmotionType.NEUTRAL, 0.0
-
         ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         best_emotion, best_score = ordered[0]
         second_score = ordered[1][1] if len(ordered) > 1 else 0.0
-        margin = max(0.0, best_score - second_score)
-        confidence = float(np.clip(0.45 * best_score + 0.55 * margin, 0.0, 0.95))
-        if confidence < 0.20:
-            return EmotionType.NEUTRAL, confidence
-        return best_emotion, confidence
+        confidence = float(np.clip(0.45 * best_score + 0.55 * max(0.0, best_score - second_score), 0.0, 0.95))
+        return (best_emotion, confidence) if confidence >= 0.20 else (EmotionType.NEUTRAL, confidence)
 
     @staticmethod
     def classify_emotion_from_text(text: str) -> EmotionResult:
@@ -221,7 +214,6 @@ class WhisperTranscriber:
         if not self.available:
             return None
         import whisper
-
         if self._model is None:
             self._model = whisper.load_model(self.model_name)
         result = self._model.transcribe(audio_file)
@@ -258,7 +250,6 @@ def classify_emotion_detailed(audio_file: str, transcribe: bool = False) -> Dict
         features = classifier.feature_extractor.extract_features(path)
         acoustic_emotion, acoustic_confidence = classifier._classify_from_features(features)
         transcription = get_transcriber().transcribe(path) if transcribe else None
-
         final_emotion = acoustic_emotion
         final_confidence = acoustic_confidence
         text_result = EmotionResult(EmotionType.NEUTRAL, 0.0)
@@ -267,7 +258,6 @@ def classify_emotion_detailed(audio_file: str, transcribe: bool = False) -> Dict
             if text_result.confidence > acoustic_confidence:
                 final_emotion = text_result.emotion
             final_confidence = float(np.clip((acoustic_confidence + text_result.confidence) / 2.0, 0.0, 0.95))
-
         return {
             "emotion": final_emotion.value,
             "confidence": final_confidence,
