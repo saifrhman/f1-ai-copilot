@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - fix/full-project-hardening
   pull_request:
   workflow_dispatch:
 
