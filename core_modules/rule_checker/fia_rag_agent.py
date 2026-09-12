@@ -1,266 +1,379 @@
 #!/usr/bin/env python3
-"""
-FIA RAG Agent
-Loads FIA regulations from PDFs and provides intelligent answers using LangChain + OpenAI
+"""Retrieval-augmented QA over FIA Formula 1 regulation PDFs.
+
+The pipeline deliberately keeps ingestion/indexing, retrieval, and generation
+separate so each stage can be inspected and tuned independently.
 """
 
-import os
+from __future__ import annotations
+
 import glob
-from typing import List, Dict, Any, Optional
-from pathlib import Path
 import logging
+import os
+import re
+import uuid
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-# LangChain imports (would need to be installed)
+logger = logging.getLogger(__name__)
+
 try:
     from langchain.document_loaders import PyPDFLoader
     from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain.embeddings import OpenAIEmbeddings
-    from langchain.vectorstores import Qdrant
-    from langchain.chat_models import ChatOpenAI
-    from langchain.chains import RetrievalQA
-    from langchain.prompts import PromptTemplate
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    logging.warning("LangChain not available. Using mock implementation.")
+    try:
+        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+    except ImportError:  # compatibility with the pinned legacy LangChain release
+        from langchain.chat_models import ChatOpenAI
+        from langchain.embeddings import OpenAIEmbeddings
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Distance, PointStruct, VectorParams
+    RAG_DEPENDENCIES_AVAILABLE = True
+    RAG_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as exc:  # allows the rest of the application to import cleanly
+    RAG_DEPENDENCIES_AVAILABLE = False
+    RAG_IMPORT_ERROR = exc
 
-# Mock OpenAI for testing
-class MockOpenAI:
-    def __init__(self, model_name="gpt-4"):
-        self.model_name = model_name
-    
-    def __call__(self, messages):
-        # Mock response for testing
-        return type('obj', (object,), {
-            'content': f"Mock response for: {messages[-1].content if messages else 'No message'}"
-        })
+
+DECLINE_ANSWER = (
+    "I cannot answer that from the indexed FIA regulations because the retrieved "
+    "context does not contain sufficient evidence."
+)
+
+
+@dataclass(frozen=True)
+class RetrievedPassage:
+    text: str
+    score: float
+    source: str
+    page: Optional[int]
+    chunk_id: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["page"] = self.page
+        return data
 
 
 class FIAKnowledgeBase:
-    """FIA regulations knowledge base using RAG"""
-    
-    def __init__(self, fia_docs_path: str = "data/fia_docs", openai_api_key: Optional[str] = None):
-        self.fia_docs_path = Path(fia_docs_path)
+    """FIA regulation RAG pipeline backed by Qdrant."""
+
+    def __init__(
+        self,
+        fia_docs_path: Optional[str] = None,
+        openai_api_key: Optional[str] = None,
+        collection_name: Optional[str] = None,
+        top_k: Optional[int] = None,
+        min_score: Optional[float] = None,
+    ) -> None:
+        self.fia_docs_path = Path(
+            fia_docs_path or os.getenv("FIA_DOCS_PATH", "data/fia_docs")
+        )
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        self.vectorstore = None
-        self.qa_chain = None
+        self.collection_name = collection_name or os.getenv(
+            "FIA_RAG_COLLECTION", "fia_regulations"
+        )
+        self.top_k = top_k or int(os.getenv("FIA_RAG_TOP_K", "5"))
+        self.min_score = (
+            min_score
+            if min_score is not None
+            else float(os.getenv("FIA_RAG_MIN_SCORE", "0.30"))
+        )
+        self.embedding_model = os.getenv(
+            "FIA_RAG_EMBEDDING_MODEL", "text-embedding-3-small"
+        )
+        self.chat_model = os.getenv("FIA_RAG_MODEL", "gpt-4o-mini")
+        self.chunk_size = int(os.getenv("FIA_RAG_CHUNK_SIZE", "1000"))
+        self.chunk_overlap = int(os.getenv("FIA_RAG_CHUNK_OVERLAP", "200"))
+
+        self.embeddings = None
+        self.llm = None
+        self.qdrant = None
         self.is_initialized = False
-        
-        # Initialize if LangChain is available
-        if LANGCHAIN_AVAILABLE and self.openai_api_key:
-            self._initialize_knowledge_base()
-        else:
-            logging.warning("Using mock FIA knowledge base")
-    
-    def _initialize_knowledge_base(self):
-        """Initialize the knowledge base with FIA documents"""
+        self.indexed_chunks = 0
+        self.last_error: Optional[str] = None
+
+    # ------------------------- initialization / ingestion -------------------------
+    def initialize(self, force_reindex: bool = False) -> None:
+        """Connect dependencies and build the vector index if necessary."""
+        if self.is_initialized and not force_reindex:
+            return
+        if not RAG_DEPENDENCIES_AVAILABLE:
+            raise RuntimeError(f"RAG dependencies are unavailable: {RAG_IMPORT_ERROR}")
+        if not self.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for FIA RAG queries")
+
+        pdf_files = sorted(glob.glob(str(self.fia_docs_path / "*.pdf")))
+        if not pdf_files:
+            raise RuntimeError(
+                f"No FIA regulation PDFs found in {self.fia_docs_path}. "
+                "Add official FIA PDF files before querying the RAG system."
+            )
+
         try:
-            # Load FIA documents
-            documents = self._load_fia_documents()
-            
-            if not documents:
-                logging.warning("No FIA documents found")
-                return
-            
-            # Split documents into chunks
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-                length_function=len,
-            )
-            texts = text_splitter.split_documents(documents)
-            
-            # Create embeddings and vector store
-            embeddings = OpenAIEmbeddings(openai_api_key=self.openai_api_key)
-            self.vectorstore = Qdrant.from_documents(
-                texts, 
-                embeddings,
-                collection_name="fia_regulations"
-            )
-            
-            # Create QA chain
-            llm = ChatOpenAI(
-                model_name="gpt-4",
+            self.embeddings = OpenAIEmbeddings(
+                model=self.embedding_model,
                 openai_api_key=self.openai_api_key,
-                temperature=0.1
             )
-            
-            prompt_template = PromptTemplate(
-                input_variables=["context", "question"],
-                template="""
-                You are an expert on FIA Formula 1 regulations. Answer the following question based on the provided context from FIA regulations.
-                
-                Context: {context}
-                
-                Question: {question}
-                
-                Answer the question accurately and cite specific FIA rules when possible. If the information is not in the context, say so.
-                """
+            self.llm = ChatOpenAI(
+                model=self.chat_model,
+                openai_api_key=self.openai_api_key,
+                temperature=0,
             )
-            
-            self.qa_chain = RetrievalQA.from_chain_type(
-                llm=llm,
-                chain_type="stuff",
-                retriever=self.vectorstore.as_retriever(search_kwargs={"k": 5}),
-                chain_type_kwargs={"prompt": prompt_template}
-            )
-            
+            self.qdrant = self._make_qdrant_client()
+
+            collection_exists = self._collection_exists()
+            if force_reindex or not collection_exists:
+                self._build_index(pdf_files)
+            else:
+                self.indexed_chunks = self._collection_count()
+                if self.indexed_chunks == 0:
+                    self._build_index(pdf_files)
+
             self.is_initialized = True
-            logging.info("FIA knowledge base initialized successfully")
-            
-        except Exception as e:
-            logging.error(f"Failed to initialize FIA knowledge base: {e}")
-    
-    def _load_fia_documents(self) -> List:
-        """Load FIA documents from the specified directory"""
-        documents = []
-        
-        if not self.fia_docs_path.exists():
-            logging.warning(f"FIA docs path does not exist: {self.fia_docs_path}")
-            return documents
-        
-        # Find all PDF files
-        pdf_files = glob.glob(str(self.fia_docs_path / "*.pdf"))
-        
-        for pdf_file in pdf_files:
-            try:
-                loader = PyPDFLoader(pdf_file)
-                documents.extend(loader.load())
-                logging.info(f"Loaded FIA document: {pdf_file}")
-            except Exception as e:
-                logging.error(f"Failed to load {pdf_file}: {e}")
-        
-        return documents
-    
-    def query(self, question: str) -> Dict[str, Any]:
-        """
-        Query the FIA knowledge base
-        
-        Args:
-            question: Question about FIA regulations
-            
-        Returns:
-            Dictionary with answer and metadata
-        """
-        if not self.is_initialized:
-            return self._mock_query(question)
-        
+            self.last_error = None
+        except Exception as exc:
+            self.is_initialized = False
+            self.last_error = str(exc)
+            logger.exception("Failed to initialize FIA RAG pipeline")
+            raise
+
+    def _make_qdrant_client(self):
+        qdrant_url = os.getenv("QDRANT_URL", "").strip()
+        if qdrant_url:
+            return QdrantClient(
+                url=qdrant_url,
+                api_key=os.getenv("QDRANT_API_KEY") or None,
+            )
+        return QdrantClient(path=os.getenv("QDRANT_PATH", ".qdrant"))
+
+    def _collection_exists(self) -> bool:
         try:
-            result = self.qa_chain({"query": question})
+            self.qdrant.get_collection(self.collection_name)
+            return True
+        except Exception:
+            return False
+
+    def _collection_count(self) -> int:
+        result = self.qdrant.count(
+            collection_name=self.collection_name,
+            exact=True,
+        )
+        return int(result.count)
+
+    def _load_and_chunk_documents(self, pdf_files: List[str]):
+        documents = []
+        for pdf_file in pdf_files:
+            loader = PyPDFLoader(pdf_file)
+            pages = loader.load()
+            for page in pages:
+                page.metadata["source"] = Path(pdf_file).name
+            documents.extend(pages)
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+        return splitter.split_documents(documents)
+
+    def _build_index(self, pdf_files: List[str]) -> None:
+        chunks = self._load_and_chunk_documents(pdf_files)
+        if not chunks:
+            raise RuntimeError("FIA PDFs were found, but no text could be extracted")
+
+        texts = [chunk.page_content for chunk in chunks]
+        vectors = self.embeddings.embed_documents(texts)
+        if not vectors or not vectors[0]:
+            raise RuntimeError("Embedding generation returned no vectors")
+
+        self.qdrant.recreate_collection(
+            collection_name=self.collection_name,
+            vectors_config=VectorParams(size=len(vectors[0]), distance=Distance.COSINE),
+        )
+
+        points = []
+        for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
+            source = str(chunk.metadata.get("source", "unknown"))
+            page = chunk.metadata.get("page")
+            chunk_key = f"{source}:{page}:{index}:{chunk.page_content}"
+            chunk_id = str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_key))
+            points.append(
+                PointStruct(
+                    id=chunk_id,
+                    vector=vector,
+                    payload={
+                        "text": chunk.page_content,
+                        "source": source,
+                        "page": page,
+                        "chunk_id": chunk_id,
+                    },
+                )
+            )
+
+        batch_size = 64
+        for start in range(0, len(points), batch_size):
+            self.qdrant.upsert(
+                collection_name=self.collection_name,
+                points=points[start : start + batch_size],
+                wait=True,
+            )
+        self.indexed_chunks = len(points)
+        logger.info("Indexed %s FIA regulation chunks", self.indexed_chunks)
+
+    # -------------------------------- retrieval ---------------------------------
+    def retrieve(self, question: str, top_k: Optional[int] = None) -> List[RetrievedPassage]:
+        """Return top-k regulation passages without invoking the answer model."""
+        self.initialize()
+        query_vector = self.embeddings.embed_query(question)
+        hits = self.qdrant.search(
+            collection_name=self.collection_name,
+            query_vector=query_vector,
+            limit=top_k or self.top_k,
+            with_payload=True,
+        )
+
+        passages: List[RetrievedPassage] = []
+        for hit in hits:
+            payload = hit.payload or {}
+            page = payload.get("page")
+            passages.append(
+                RetrievedPassage(
+                    text=str(payload.get("text", "")),
+                    score=float(hit.score),
+                    source=str(payload.get("source", "unknown")),
+                    page=(int(page) + 1) if page is not None else None,
+                    chunk_id=str(payload.get("chunk_id", hit.id)),
+                )
+            )
+        return passages
+
+    # -------------------------------- generation --------------------------------
+    @staticmethod
+    def _format_context(passages: List[RetrievedPassage]) -> str:
+        blocks = []
+        for i, passage in enumerate(passages, start=1):
+            page = f", page {passage.page}" if passage.page is not None else ""
+            blocks.append(
+                f"[S{i}] {passage.source}{page}\n"
+                f"Retrieval score: {passage.score:.3f}\n"
+                f"{passage.text}"
+            )
+        return "\n\n".join(blocks)
+
+    def generate_answer(self, question: str, passages: List[RetrievedPassage]) -> str:
+        """Generate an answer from already-retrieved evidence."""
+        if not passages or max(p.score for p in passages) < self.min_score:
+            return DECLINE_ANSWER
+
+        context = self._format_context(passages)
+        prompt = f"""You are an FIA Formula 1 regulations assistant.
+
+Use ONLY the retrieved regulation excerpts below. Do not use memory or general F1 knowledge.
+If the excerpts do not contain enough evidence to answer the question, reply exactly:
+{DECLINE_ANSWER}
+
+When you do answer:
+- cite the relevant article/section number exactly as it appears in the excerpts;
+- attach one or more source labels such as [S1] or [S2] to each material claim;
+- do not invent article numbers, penalties, thresholds, dates, or exceptions;
+- distinguish a regulation statement from any inference you make.
+
+Retrieved regulation excerpts:
+{context}
+
+Question: {question}
+Answer:"""
+        response = self.llm.invoke(prompt)
+        return str(getattr(response, "content", response)).strip()
+
+    def query(self, question: str) -> Dict[str, Any]:
+        """Retrieve evidence first, then generate a grounded answer."""
+        try:
+            passages = self.retrieve(question)
+            top_score = max((p.score for p in passages), default=0.0)
+            enough_evidence = bool(passages) and top_score >= self.min_score
+            answer = self.generate_answer(question, passages)
             return {
-                "answer": result["result"],
+                "answer": answer,
                 "source": "fia_rag_agent",
-                "confidence": 0.85,  # Placeholder
-                "referenced_rules": self._extract_rules(result["result"])
+                "grounded": enough_evidence and answer != DECLINE_ANSWER,
+                "top_retrieval_score": round(top_score, 4),
+                "retrieved_passages": [p.to_dict() for p in passages],
+                "referenced_rules": self._extract_rules(answer),
+                "citations": sorted(set(re.findall(r"\[S\d+\]", answer))),
             }
-        except Exception as e:
-            logging.error(f"Query failed: {e}")
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception("FIA RAG query failed")
             return {
-                "answer": f"Error querying FIA regulations: {str(e)}",
+                "answer": f"FIA RAG is unavailable: {exc}",
                 "source": "fia_rag_agent",
-                "confidence": 0.0,
-                "referenced_rules": []
+                "grounded": False,
+                "top_retrieval_score": 0.0,
+                "retrieved_passages": [],
+                "referenced_rules": [],
+                "citations": [],
             }
-    
-    def _mock_query(self, question: str) -> Dict[str, Any]:
-        """Mock query for testing without LangChain"""
-        mock_answers = {
-            "track limits": "Track limits violations are governed by Article 38.3. Drivers must stay within the track boundaries defined by the white lines. Exceeding track limits may result in lap time deletion or penalties.",
-            "unsafe release": "Unsafe release penalties are covered under Article 38.4. Pit crews must ensure safe release of cars and avoid impeding other drivers. Penalties range from 5-second time penalties to grid drops.",
-            "collision": "Collision penalties are determined by the stewards based on Article 38.1. Factors include intent, severity, and impact on race outcome. Penalties can include time penalties, grid drops, or disqualification.",
-            "blocking": "Blocking is regulated under Article 38.2. Drivers must not deliberately impede faster cars. Blocking penalties typically result in 5-10 second time penalties.",
-            "drs": "DRS (Drag Reduction System) usage is governed by Article 27.5. DRS can only be used in designated zones when within 1 second of the car ahead.",
-            "fuel": "Fuel regulations are covered under Article 30. Teams must use fuel that meets FIA specifications. Fuel samples may be taken for analysis.",
-            "tires": "Tire regulations are detailed in Article 24. Teams must use FIA-approved compounds and follow prescribed usage rules."
-        }
-        
-        # Find best matching answer
-        best_match = "general"
-        for key, answer in mock_answers.items():
-            if key.lower() in question.lower():
-                best_match = key
-                break
-        
+
+    def status(self) -> Dict[str, Any]:
+        pdf_count = len(glob.glob(str(self.fia_docs_path / "*.pdf")))
         return {
-            "answer": mock_answers.get(best_match, "I don't have specific information about that FIA regulation. Please consult the official FIA sporting regulations."),
-            "source": "fia_rag_agent_mock",
-            "confidence": 0.7,
-            "referenced_rules": [f"Article {hash(question) % 50}.{hash(question) % 10}"]
+            "ready": self.is_initialized,
+            "dependencies_available": RAG_DEPENDENCIES_AVAILABLE,
+            "api_key_configured": bool(self.openai_api_key),
+            "docs_path": str(self.fia_docs_path),
+            "pdf_count": pdf_count,
+            "collection": self.collection_name,
+            "indexed_chunks": self.indexed_chunks,
+            "top_k": self.top_k,
+            "min_score": self.min_score,
+            "last_error": self.last_error,
         }
-    
-    def _extract_rules(self, answer: str) -> List[str]:
-        """Extract referenced FIA rules from answer"""
-        # Simple rule extraction - in production would use more sophisticated parsing
-        rules = []
-        if "Article" in answer:
-            import re
-            article_matches = re.findall(r"Article \d+\.?\d*", answer)
-            rules.extend(article_matches)
-        return rules
+
+    @staticmethod
+    def _extract_rules(answer: str) -> List[str]:
+        # Covers forms such as Article 38, Article 38.3, and Regulation 12.4.1.
+        matches = re.findall(
+            r"\b(?:Article|Regulation|Section)\s+\d+(?:\.\d+)*",
+            answer,
+            flags=re.IGNORECASE,
+        )
+        return sorted(set(matches))
 
 
-# Global FIA knowledge base instance
-_fia_kb = None
+_fia_kb: Optional[FIAKnowledgeBase] = None
+
 
 def get_fia_knowledge_base() -> FIAKnowledgeBase:
-    """Get or create FIA knowledge base instance"""
     global _fia_kb
     if _fia_kb is None:
         _fia_kb = FIAKnowledgeBase()
     return _fia_kb
 
+
 def query_fia_regulations(question: str) -> str:
-    """
-    Query FIA regulations using RAG system
-    
-    Args:
-        question: Question about FIA regulations
-        
-    Returns:
-        Answer based on FIA regulations
-    """
-    kb = get_fia_knowledge_base()
-    result = kb.query(question)
-    return result["answer"]
+    return get_fia_knowledge_base().query(question)["answer"]
 
 
 def query_fia_regulations_detailed(question: str) -> Dict[str, Any]:
-    """
-    Query FIA regulations with detailed response
-    
-    Args:
-        question: Question about FIA regulations
-        
-    Returns:
-        Detailed response with answer, confidence, and referenced rules
-    """
-    kb = get_fia_knowledge_base()
-    return kb.query(question)
+    return get_fia_knowledge_base().query(question)
 
 
-# Example usage and testing
+def retrieve_fia_passages(question: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Expose retrieval independently for debugging and evaluation."""
+    passages = get_fia_knowledge_base().retrieve(question, top_k=top_k)
+    return [passage.to_dict() for passage in passages]
+
+
 if __name__ == "__main__":
-    # Test the FIA RAG agent
-    print("🏁 FIA RAG Agent Test")
-    print("=" * 50)
-    
-    test_questions = [
-        "What are the penalties for track limits violations?",
-        "How is unsafe release penalized?",
-        "What are the DRS usage rules?",
-        "What are the fuel regulations?",
-        "What happens if a driver causes a collision?"
-    ]
-    
-    for question in test_questions:
-        print(f"\n❓ Question: {question}")
-        answer = query_fia_regulations(question)
-        print(f"📋 Answer: {answer}")
-        print("-" * 50)
-    
-    # Test detailed query
-    print("\n🔍 Detailed Query Test:")
-    detailed_result = query_fia_regulations_detailed("What are the tire regulations?")
-    print(f"Answer: {detailed_result['answer']}")
-    print(f"Confidence: {detailed_result['confidence']}")
-    print(f"Referenced Rules: {detailed_result['referenced_rules']}") 
+    kb = get_fia_knowledge_base()
+    print(kb.status())
+    for question in (
+        "What are the rules for an unsafe release?",
+        "When can a driver use DRS?",
+        "What does the regulation say about track limits?",
+    ):
+        print("\nQuestion:", question)
+        print(kb.query(question))
