@@ -1,0 +1,40 @@
+name: Project integration tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  project-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - name: Install system audio dependency
+        run: sudo apt-get update && sudo apt-get install -y libsndfile1
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python source
+        run: python -m compileall -q app core_modules scripts tests
+      - name: Run complete test suite
+        run: python -m pytest -q
+      - name: Exercise strategy example
+        run: python -m core_modules.strategy_optimizer.example_usage
+
+  fia-official-source-discovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install downloader dependency
+        run: pip install requests==2.31.0
+      - name: Verify current FIA regulation links can be discovered
+        run: python scripts/fetch_fia_regulations.py --year 2026 --dry-run

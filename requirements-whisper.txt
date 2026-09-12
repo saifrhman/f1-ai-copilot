@@ -1,0 +1,4 @@
+# Optional local speech-to-text support for driver-radio transcription.
+# Requires ffmpeg to be installed on the host.
+-r requirements.txt
+openai-whisper==20250625

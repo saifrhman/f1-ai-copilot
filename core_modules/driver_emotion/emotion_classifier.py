@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""
-Driver Emotion Classifier
-Classifies driver emotions from radio communication using Whisper + emotion models
-"""
+"""Driver radio emotion analysis from real audio features with optional Whisper transcription."""
 
-import os
+import base64
+import binascii
 import logging
-from typing import Dict, List, Any, Optional, Tuple
+import os
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
-import numpy as np
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
 import librosa
+import numpy as np
 
 
 class EmotionType(Enum):
@@ -25,7 +27,6 @@ class EmotionType(Enum):
 
 @dataclass
 class EmotionResult:
-    """Result of emotion classification"""
     emotion: EmotionType
     confidence: float
     timestamp: Optional[str] = None
@@ -33,398 +34,244 @@ class EmotionResult:
     audio_features: Optional[Dict[str, float]] = None
 
 
-class AudioFeatureExtractor:
-    """Extracts audio features for emotion classification"""
-    
-    def __init__(self):
-        self.sample_rate = 22050  # Standard sample rate for analysis
-    
-    def extract_features(self, audio_file: str) -> Dict[str, float]:
-        """
-        Extract audio features from audio file
-        
-        Args:
-            audio_file: Path to audio file
-            
-        Returns:
-            Dictionary of audio features
-        """
+def _decode_audio_input(audio_input: str) -> Tuple[str, Optional[str]]:
+    """Return an audio path plus an optional temporary path to remove later."""
+
+    value = audio_input.strip()
+    if not value:
+        raise ValueError("audio_file cannot be empty")
+
+    # Raw base64 can be thousands of characters long. Do not pass such strings
+    # to pathlib.stat(), which can raise ENAMETOOLONG before we get a chance to
+    # decode them. Plausible filesystem paths are checked first.
+    if not value.startswith("data:") and len(value) <= 1024:
         try:
-            # Load audio file
-            y, sr = librosa.load(audio_file, sr=self.sample_rate)
-            
-            features = {}
-            
-            # Pitch features
-            pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-            features['mean_pitch'] = np.mean(pitches[magnitudes > 0.1])
-            features['pitch_std'] = np.std(pitches[magnitudes > 0.1])
-            
-            # Energy features
-            features['rms_energy'] = np.mean(librosa.feature.rms(y=y))
-            features['energy_std'] = np.std(librosa.feature.rms(y=y))
-            
-            # Spectral features
-            spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)
-            features['spectral_centroid_mean'] = np.mean(spectral_centroids)
-            features['spectral_centroid_std'] = np.std(spectral_centroids)
-            
-            # MFCC features
-            mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-            features['mfcc_mean'] = np.mean(mfccs)
-            features['mfcc_std'] = np.std(mfccs)
-            
-            # Tempo features
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            features['tempo'] = tempo
-            
-            # Zero crossing rate
-            zcr = librosa.feature.zero_crossing_rate(y)
-            features['zero_crossing_rate'] = np.mean(zcr)
-            
-            return features
-            
-        except Exception as e:
-            logging.error(f"Failed to extract audio features: {e}")
-            return {}
-    
-    def extract_mock_features(self) -> Dict[str, float]:
-        """Extract mock features for testing"""
-        return {
-            'mean_pitch': 150.0,
-            'pitch_std': 25.0,
-            'rms_energy': 0.3,
-            'energy_std': 0.1,
-            'spectral_centroid_mean': 2000.0,
-            'spectral_centroid_std': 500.0,
-            'mfcc_mean': 0.0,
-            'mfcc_std': 1.0,
-            'tempo': 120.0,
-            'zero_crossing_rate': 0.05
+            path = Path(value)
+            if path.exists() and path.is_file():
+                return str(path), None
+        except OSError:
+            pass
+
+    payload = value
+    suffix = ".wav"
+    if payload.startswith("data:"):
+        header, sep, payload = payload.partition(",")
+        if not sep or ";base64" not in header:
+            raise ValueError("Audio data URI must be base64 encoded")
+        if "audio/mpeg" in header:
+            suffix = ".mp3"
+        elif "audio/ogg" in header:
+            suffix = ".ogg"
+        elif "audio/flac" in header:
+            suffix = ".flac"
+
+    try:
+        decoded = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("audio_file must be an existing path or valid base64 audio") from exc
+    if not decoded:
+        raise ValueError("Decoded audio is empty")
+
+    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        handle.write(decoded)
+        handle.flush()
+    finally:
+        handle.close()
+    return handle.name, handle.name
+
+
+class AudioFeatureExtractor:
+    """Extract acoustic features used by the transparent heuristic classifier."""
+
+    def __init__(self, sample_rate: int = 22050):
+        self.sample_rate = sample_rate
+
+    def extract_features(self, audio_file: str) -> Dict[str, float]:
+        y, sr = librosa.load(audio_file, sr=self.sample_rate, mono=True)
+        if y.size == 0:
+            raise ValueError("Audio file contains no samples")
+        duration = float(librosa.get_duration(y=y, sr=sr))
+        if duration <= 0:
+            raise ValueError("Audio duration must be positive")
+
+        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+        voiced = pitches[magnitudes > max(0.1, float(np.percentile(magnitudes, 75)))]
+        mean_pitch = float(np.mean(voiced)) if voiced.size else 0.0
+        pitch_std = float(np.std(voiced)) if voiced.size else 0.0
+        rms = librosa.feature.rms(y=y)
+        spectral = librosa.feature.spectral_centroid(y=y, sr=sr)
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        tempo_value = float(np.asarray(tempo).reshape(-1)[0]) if np.asarray(tempo).size else 0.0
+        zcr = librosa.feature.zero_crossing_rate(y)
+
+        features = {
+            "mean_pitch": mean_pitch,
+            "pitch_std": pitch_std,
+            "rms_energy": float(np.mean(rms)),
+            "energy_std": float(np.std(rms)),
+            "spectral_centroid_mean": float(np.mean(spectral)),
+            "spectral_centroid_std": float(np.std(spectral)),
+            "mfcc_mean": float(np.mean(mfccs)),
+            "mfcc_std": float(np.std(mfccs)),
+            "tempo": tempo_value,
+            "zero_crossing_rate": float(np.mean(zcr)),
+            "duration": duration,
         }
+        if not all(np.isfinite(value) for value in features.values()):
+            raise ValueError("Audio feature extraction produced non-finite values")
+        return features
 
 
 class EmotionClassifier:
-    """Classifies emotions from audio features"""
-    
+    """Heuristic acoustic/text classifier. Confidence values are similarity scores, not probabilities."""
+
     def __init__(self):
         self.feature_extractor = AudioFeatureExtractor()
         self.emotion_thresholds = self._load_emotion_thresholds()
-    
-    def _load_emotion_thresholds(self) -> Dict[EmotionType, Dict[str, Tuple[float, float]]]:
-        """Load emotion classification thresholds"""
+
+    @staticmethod
+    def _load_emotion_thresholds() -> Dict[EmotionType, Dict[str, Tuple[float, float]]]:
         return {
-            EmotionType.CALM: {
-                'mean_pitch': (100, 200),
-                'pitch_std': (10, 30),
-                'rms_energy': (0.1, 0.4),
-                'energy_std': (0.05, 0.15)
-            },
-            EmotionType.ANGRY: {
-                'mean_pitch': (200, 400),
-                'pitch_std': (40, 80),
-                'rms_energy': (0.5, 1.0),
-                'energy_std': (0.2, 0.5)
-            },
-            EmotionType.PANICKED: {
-                'mean_pitch': (300, 500),
-                'pitch_std': (60, 100),
-                'rms_energy': (0.6, 1.0),
-                'energy_std': (0.3, 0.6)
-            },
-            EmotionType.FOCUSED: {
-                'mean_pitch': (150, 250),
-                'pitch_std': (20, 40),
-                'rms_energy': (0.3, 0.6),
-                'energy_std': (0.1, 0.2)
-            },
-            EmotionType.EXCITED: {
-                'mean_pitch': (200, 350),
-                'pitch_std': (30, 60),
-                'rms_energy': (0.4, 0.8),
-                'energy_std': (0.15, 0.3)
-            },
-            EmotionType.FRUSTRATED: {
-                'mean_pitch': (180, 300),
-                'pitch_std': (35, 65),
-                'rms_energy': (0.4, 0.7),
-                'energy_std': (0.2, 0.4)
-            }
+            EmotionType.CALM: {"mean_pitch": (90, 210), "pitch_std": (5, 35), "rms_energy": (0.02, 0.35), "energy_std": (0.0, 0.15)},
+            EmotionType.ANGRY: {"mean_pitch": (180, 420), "pitch_std": (30, 100), "rms_energy": (0.25, 1.0), "energy_std": (0.08, 0.50)},
+            EmotionType.PANICKED: {"mean_pitch": (250, 550), "pitch_std": (45, 140), "rms_energy": (0.30, 1.0), "energy_std": (0.12, 0.60)},
+            EmotionType.FOCUSED: {"mean_pitch": (120, 280), "pitch_std": (10, 50), "rms_energy": (0.08, 0.50), "energy_std": (0.02, 0.20)},
+            EmotionType.EXCITED: {"mean_pitch": (180, 400), "pitch_std": (25, 90), "rms_energy": (0.20, 0.85), "energy_std": (0.07, 0.35)},
+            EmotionType.FRUSTRATED: {"mean_pitch": (150, 340), "pitch_std": (25, 85), "rms_energy": (0.15, 0.75), "energy_std": (0.08, 0.40)},
         }
-    
+
     def classify_emotion(self, audio_file: str) -> EmotionResult:
-        """
-        Classify emotion from audio file
-        
-        Args:
-            audio_file: Path to audio file or base64 encoded audio
-            
-        Returns:
-            EmotionResult with classification
-        """
+        path, temporary = _decode_audio_input(audio_file)
         try:
-            # Extract audio features
-            features = self.feature_extractor.extract_features(audio_file)
-            
-            if not features:
-                # Use mock features for testing
-                features = self.feature_extractor.extract_mock_features()
-            
-            # Classify emotion based on features
+            features = self.feature_extractor.extract_features(path)
             emotion, confidence = self._classify_from_features(features)
-            
-            return EmotionResult(
-                emotion=emotion,
-                confidence=confidence,
-                audio_features=features
-            )
-            
-        except Exception as e:
-            logging.error(f"Emotion classification failed: {e}")
-            return EmotionResult(
-                emotion=EmotionType.NEUTRAL,
-                confidence=0.0
-            )
-    
+            return EmotionResult(emotion=emotion, confidence=confidence, duration=features.get("duration"), audio_features=features)
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
     def _classify_from_features(self, features: Dict[str, float]) -> Tuple[EmotionType, float]:
-        """Classify emotion from extracted features"""
-        emotion_scores = {}
-        
+        scores: Dict[EmotionType, float] = {}
         for emotion, thresholds in self.emotion_thresholds.items():
-            score = 0.0
-            total_features = 0
-            
-            for feature_name, (min_val, max_val) in thresholds.items():
-                if feature_name in features:
-                    feature_value = features[feature_name]
-                    
-                    # Calculate how well the feature matches the emotion
-                    if min_val <= feature_value <= max_val:
-                        # Perfect match
-                        score += 1.0
-                    else:
-                        # Calculate distance from ideal range
-                        if feature_value < min_val:
-                            distance = (min_val - feature_value) / min_val
-                        else:
-                            distance = (feature_value - max_val) / max_val
-                        
-                        # Score based on distance (closer = higher score)
-                        score += max(0, 1 - distance)
-                    
-                    total_features += 1
-            
-            if total_features > 0:
-                emotion_scores[emotion] = score / total_features
-        
-        # Find emotion with highest score
-        if emotion_scores:
-            best_emotion = max(emotion_scores.items(), key=lambda x: x[1])
-            return best_emotion[0], best_emotion[1]
-        
-        return EmotionType.NEUTRAL, 0.5
-    
-    def classify_emotion_from_text(self, text: str) -> EmotionResult:
-        """
-        Classify emotion from transcribed text (fallback method)
-        
-        Args:
-            text: Transcribed radio communication text
-            
-        Returns:
-            EmotionResult with classification
-        """
+            parts = []
+            for name, (minimum, maximum) in thresholds.items():
+                if name not in features:
+                    continue
+                value = float(features[name])
+                if minimum <= value <= maximum:
+                    parts.append(1.0)
+                elif value < minimum:
+                    parts.append(max(0.0, 1.0 - (minimum - value) / max(abs(minimum), 1e-6)))
+                else:
+                    parts.append(max(0.0, 1.0 - (value - maximum) / max(abs(maximum), 1e-6)))
+            if parts:
+                scores[emotion] = float(np.mean(parts))
+
+        if not scores:
+            return EmotionType.NEUTRAL, 0.0
+        ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        best_emotion, best_score = ordered[0]
+        second_score = ordered[1][1] if len(ordered) > 1 else 0.0
+        confidence = float(np.clip(0.45 * best_score + 0.55 * max(0.0, best_score - second_score), 0.0, 0.95))
+        return (best_emotion, confidence) if confidence >= 0.20 else (EmotionType.NEUTRAL, confidence)
+
+    @staticmethod
+    def classify_emotion_from_text(text: str) -> EmotionResult:
         text_lower = text.lower()
-        
-        # Keyword-based emotion classification
-        emotion_keywords = {
-            EmotionType.ANGRY: ['angry', 'furious', 'mad', 'pissed', 'damn', 'shit'],
-            EmotionType.FRUSTRATED: ['frustrated', 'annoyed', 'upset', 'disappointed'],
-            EmotionType.PANICKED: ['panic', 'emergency', 'help', 'urgent', 'quick'],
-            EmotionType.EXCITED: ['excited', 'great', 'amazing', 'fantastic', 'brilliant'],
-            EmotionType.FOCUSED: ['focus', 'concentrate', 'careful', 'steady'],
-            EmotionType.CALM: ['calm', 'relaxed', 'steady', 'smooth']
+        keywords = {
+            EmotionType.ANGRY: ["angry", "furious", "mad", "damn", "shit"],
+            EmotionType.FRUSTRATED: ["frustrated", "annoyed", "upset", "struggling", "no grip"],
+            EmotionType.PANICKED: ["panic", "emergency", "help", "urgent", "quick"],
+            EmotionType.EXCITED: ["great", "amazing", "fantastic", "brilliant", "yes"],
+            EmotionType.FOCUSED: ["focus", "careful", "steady", "copy", "understood"],
+            EmotionType.CALM: ["calm", "relaxed", "smooth", "okay", "ok"],
         }
-        
-        emotion_scores = {}
-        for emotion, keywords in emotion_keywords.items():
-            score = sum(1 for keyword in keywords if keyword in text_lower)
-            if score > 0:
-                emotion_scores[emotion] = score / len(keywords)
-        
-        if emotion_scores:
-            best_emotion = max(emotion_scores.items(), key=lambda x: x[1])
-            return EmotionResult(
-                emotion=best_emotion[0],
-                confidence=min(0.9, best_emotion[1] + 0.3)
-            )
-        
-        return EmotionResult(
-            emotion=EmotionType.NEUTRAL,
-            confidence=0.5
-        )
+        scores = {emotion: sum(1 for word in words if word in text_lower) for emotion, words in keywords.items()}
+        best_emotion, hits = max(scores.items(), key=lambda item: item[1])
+        if hits == 0:
+            return EmotionResult(EmotionType.NEUTRAL, 0.0)
+        return EmotionResult(best_emotion, float(min(0.85, 0.35 + 0.15 * hits)))
 
 
 class WhisperTranscriber:
-    """Transcribes audio using Whisper (mock implementation)"""
-    
-    def __init__(self):
-        self.available = self._check_whisper_availability()
-    
-    def _check_whisper_availability(self) -> bool:
-        """Check if Whisper is available"""
+    """Optional OpenAI Whisper transcription. It never fabricates a fallback transcript."""
+
+    def __init__(self, model_name: str = "base"):
+        self.model_name = model_name
+        self._model = None
         try:
-            import whisper
-            return True
+            import whisper  # noqa: F401
+            self.available = True
         except ImportError:
-            logging.warning("Whisper not available. Using mock transcription.")
-            return False
-    
-    def transcribe(self, audio_file: str) -> str:
-        """
-        Transcribe audio file to text
-        
-        Args:
-            audio_file: Path to audio file
-            
-        Returns:
-            Transcribed text
-        """
+            self.available = False
+
+    def transcribe(self, audio_file: str) -> Optional[str]:
         if not self.available:
-            return self._mock_transcribe(audio_file)
-        
-        try:
-            import whisper
-            model = whisper.load_model("base")
-            result = model.transcribe(audio_file)
-            return result["text"]
-        except Exception as e:
-            logging.error(f"Whisper transcription failed: {e}")
-            return self._mock_transcribe(audio_file)
-    
-    def _mock_transcribe(self, audio_file: str) -> str:
-        """Mock transcription for testing"""
-        mock_transcriptions = [
-            "The car feels good, but I'm losing time in sector 2.",
-            "Damn it! The tires are gone, I can't get any grip!",
-            "I need to pit now, the fuel is running low.",
-            "Great lap! The car is working perfectly.",
-            "I'm struggling with the balance, need to adjust the setup."
-        ]
-        
-        # Use file hash to get consistent mock transcription
-        file_hash = hash(audio_file) % len(mock_transcriptions)
-        return mock_transcriptions[file_hash]
+            return None
+        import whisper
+        if self._model is None:
+            self._model = whisper.load_model(self.model_name)
+        result = self._model.transcribe(audio_file)
+        text = str(result.get("text", "")).strip()
+        return text or None
 
 
-# Global instances
-_emotion_classifier = None
-_transcriber = None
+_emotion_classifier: Optional[EmotionClassifier] = None
+_transcriber: Optional[WhisperTranscriber] = None
+
 
 def get_emotion_classifier() -> EmotionClassifier:
-    """Get or create emotion classifier instance"""
     global _emotion_classifier
     if _emotion_classifier is None:
         _emotion_classifier = EmotionClassifier()
     return _emotion_classifier
 
+
 def get_transcriber() -> WhisperTranscriber:
-    """Get or create transcriber instance"""
     global _transcriber
     if _transcriber is None:
         _transcriber = WhisperTranscriber()
     return _transcriber
 
+
 def classify_emotion(audio_file: str) -> str:
-    """
-    Classify driver emotion from audio file
-    
-    Args:
-        audio_file: Path to audio file or base64 encoded audio
-        
-    Returns:
-        Classified emotion as string
-    """
-    classifier = get_emotion_classifier()
-    result = classifier.classify_emotion(audio_file)
-    return result.emotion.value
-
-def classify_emotion_detailed(audio_file: str) -> Dict[str, Any]:
-    """
-    Classify driver emotion with detailed results
-    
-    Args:
-        audio_file: Path to audio file
-        
-    Returns:
-        Detailed emotion classification results
-    """
-    classifier = get_emotion_classifier()
-    transcriber = get_transcriber()
-    
-    # Classify emotion
-    emotion_result = classifier.classify_emotion(audio_file)
-    
-    # Transcribe audio
-    transcription = transcriber.transcribe(audio_file)
-    
-    # Cross-reference with text-based classification
-    text_emotion = classifier.classify_emotion_from_text(transcription)
-    
-    # Combine results
-    final_confidence = (emotion_result.confidence + text_emotion.confidence) / 2
-    final_emotion = emotion_result.emotion if emotion_result.confidence > text_emotion.confidence else text_emotion.emotion
-    
-    return {
-        "emotion": final_emotion.value,
-        "confidence": final_confidence,
-        "transcription": transcription,
-        "audio_features": emotion_result.audio_features,
-        "text_emotion": text_emotion.emotion.value,
-        "text_confidence": text_emotion.confidence
-    }
+    return get_emotion_classifier().classify_emotion(audio_file).emotion.value
 
 
-# Example usage and testing
-if __name__ == "__main__":
-    print("🏁 Driver Emotion Classifier Test")
-    print("=" * 50)
-    
-    classifier = get_emotion_classifier()
-    transcriber = get_transcriber()
-    
-    # Test with mock audio files
-    test_audio_files = [
-        "radio_communication_1.wav",
-        "radio_communication_2.wav",
-        "radio_communication_3.wav",
-        "radio_communication_4.wav",
-        "radio_communication_5.wav"
-    ]
-    
-    for i, audio_file in enumerate(test_audio_files, 1):
-        print(f"\n🎤 Audio File {i}: {audio_file}")
-        
-        # Classify emotion
-        emotion_result = classifier.classify_emotion(audio_file)
-        
-        # Transcribe
-        transcription = transcriber.transcribe(audio_file)
-        
-        print(f"   🎭 Emotion: {emotion_result.emotion.value}")
-        print(f"   🎯 Confidence: {emotion_result.confidence:.2f}")
-        print(f"   📝 Transcription: {transcription}")
-        
-        if emotion_result.audio_features:
-            print(f"   🔊 Audio Features: {len(emotion_result.audio_features)} features extracted")
-        
-        print("-" * 50)
-    
-    # Test detailed classification
-    print("\n🔍 Detailed Classification Test:")
-    detailed_result = classify_emotion_detailed("test_radio.wav")
-    print(f"Final Emotion: {detailed_result['emotion']}")
-    print(f"Confidence: {detailed_result['confidence']:.2f}")
-    print(f"Transcription: {detailed_result['transcription']}")
-    print(f"Text Emotion: {detailed_result['text_emotion']}")
-    print(f"Text Confidence: {detailed_result['text_confidence']:.2f}") 
+def classify_emotion_detailed(audio_file: str, transcribe: bool = False) -> Dict[str, Any]:
+    path, temporary = _decode_audio_input(audio_file)
+    try:
+        classifier = get_emotion_classifier()
+        features = classifier.feature_extractor.extract_features(path)
+        acoustic_emotion, acoustic_confidence = classifier._classify_from_features(features)
+        transcription = get_transcriber().transcribe(path) if transcribe else None
+        final_emotion = acoustic_emotion
+        final_confidence = acoustic_confidence
+        text_result = EmotionResult(EmotionType.NEUTRAL, 0.0)
+        if transcription:
+            text_result = classifier.classify_emotion_from_text(transcription)
+            if text_result.confidence > acoustic_confidence:
+                final_emotion = text_result.emotion
+            final_confidence = float(np.clip((acoustic_confidence + text_result.confidence) / 2.0, 0.0, 0.95))
+        return {
+            "emotion": final_emotion.value,
+            "confidence": final_confidence,
+            "transcription": transcription,
+            "transcription_available": get_transcriber().available,
+            "audio_features": features,
+            "duration": features.get("duration"),
+            "text_emotion": text_result.emotion.value if transcription else None,
+            "text_confidence": text_result.confidence if transcription else None,
+            "classifier": "acoustic heuristic" + (" + Whisper text" if transcription else ""),
+        }
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                logging.warning("Could not remove temporary audio file %s", temporary)

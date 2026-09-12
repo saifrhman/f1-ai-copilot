@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""
-Setup Recommender
-Uses Bayesian optimization to recommend optimal car setups based on conditions
-"""
+"""Car setup recommender using an Optuna TPE search over a transparent heuristic objective."""
 
-import numpy as np
-from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
-import random
+from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+import optuna
 
 
 class WeatherCondition(Enum):
@@ -26,17 +24,15 @@ class TrackType(Enum):
 
 @dataclass
 class DriverPreferences:
-    """Driver setup preferences"""
     preferred_ride_height: Optional[float] = None
     preferred_wing_angles: Optional[Dict[str, float]] = None
     preferred_diff_settings: Optional[Dict[str, float]] = None
-    risk_tolerance: float = 0.5  # 0-1, higher = more aggressive
-    tire_management: float = 0.5  # 0-1, higher = better tire saving
+    risk_tolerance: float = 0.5
+    tire_management: float = 0.5
 
 
 @dataclass
 class TrackProfile:
-    """Track characteristics"""
     track_name: str
     track_length: float
     corners: int
@@ -44,12 +40,11 @@ class TrackProfile:
     low_speed_sections: int
     track_type: TrackType
     average_speed: float
-    downforce_requirement: float  # 0-1, higher = more downforce needed
+    downforce_requirement: float
 
 
 @dataclass
 class WeatherData:
-    """Weather conditions"""
     condition: WeatherCondition
     temperature: float
     humidity: float
@@ -58,7 +53,6 @@ class WeatherData:
 
 @dataclass
 class SetupConfiguration:
-    """Car setup configuration"""
     ride_height: float
     front_wing_angle: float
     rear_wing_angle: float
@@ -69,504 +63,286 @@ class SetupConfiguration:
 
 
 class SetupOptimizer:
-    """Bayesian optimization for car setup"""
-    
-    def __init__(self):
+    """Recommend a setup with a reproducible TPE/Bayesian-style parameter search."""
+
+    def __init__(self, n_trials: int = 48, seed: int = 42):
+        self.n_trials = max(8, int(n_trials))
+        self.seed = int(seed)
         self.track_profiles = self._load_track_profiles()
         self.weather_effects = self._load_weather_effects()
         self.setup_constraints = self._load_setup_constraints()
-    
+
     def _load_track_profiles(self) -> Dict[str, TrackProfile]:
-        """Load track profile data"""
         return {
-            "monaco": TrackProfile(
-                track_name="Circuit de Monaco",
-                track_length=3337,
-                corners=19,
-                high_speed_sections=2,
-                low_speed_sections=15,
-                track_type=TrackType.TECHNICAL,
-                average_speed=160,
-                downforce_requirement=0.9
-            ),
-            "silverstone": TrackProfile(
-                track_name="Silverstone Circuit",
-                track_length=5891,
-                corners=18,
-                high_speed_sections=8,
-                low_speed_sections=4,
-                track_type=TrackType.HIGH_SPEED,
-                average_speed=220,
-                downforce_requirement=0.6
-            ),
-            "spa": TrackProfile(
-                track_name="Circuit de Spa-Francorchamps",
-                track_length=7004,
-                corners=20,
-                high_speed_sections=10,
-                low_speed_sections=6,
-                track_type=TrackType.MIXED,
-                average_speed=200,
-                downforce_requirement=0.7
-            ),
-            "singapore": TrackProfile(
-                track_name="Marina Bay Street Circuit",
-                track_length=5063,
-                corners=23,
-                high_speed_sections=3,
-                low_speed_sections=18,
-                track_type=TrackType.TECHNICAL,
-                average_speed=170,
-                downforce_requirement=0.8
-            )
+            "monaco": TrackProfile("Circuit de Monaco", 3337, 19, 2, 15, TrackType.TECHNICAL, 160, 0.90),
+            "silverstone": TrackProfile("Silverstone Circuit", 5891, 18, 8, 4, TrackType.HIGH_SPEED, 220, 0.60),
+            "spa": TrackProfile("Circuit de Spa-Francorchamps", 7004, 20, 10, 6, TrackType.MIXED, 200, 0.70),
+            "singapore": TrackProfile("Marina Bay Street Circuit", 5063, 23, 3, 18, TrackType.TECHNICAL, 170, 0.85),
         }
-    
-    def _load_weather_effects(self) -> Dict[WeatherCondition, Dict[str, float]]:
-        """Load weather effects on setup"""
+
+    @staticmethod
+    def _load_weather_effects() -> Dict[WeatherCondition, Dict[str, float]]:
         return {
-            WeatherCondition.DRY: {
-                "downforce_multiplier": 1.0,
-                "ride_height_adjustment": 0.0,
-                "tire_pressure_adjustment": 0.0
-            },
-            WeatherCondition.WET: {
-                "downforce_multiplier": 1.2,
-                "ride_height_adjustment": 5.0,  # mm higher
-                "tire_pressure_adjustment": -0.2  # bar lower
-            },
-            WeatherCondition.INTERMEDIATE: {
-                "downforce_multiplier": 1.1,
-                "ride_height_adjustment": 2.5,
-                "tire_pressure_adjustment": -0.1
-            }
+            WeatherCondition.DRY: {"downforce_multiplier": 1.0, "ride_height_adjustment": 0.0, "tire_pressure_adjustment": 0.0},
+            WeatherCondition.WET: {"downforce_multiplier": 1.15, "ride_height_adjustment": 5.0, "tire_pressure_adjustment": -0.10},
+            WeatherCondition.INTERMEDIATE: {"downforce_multiplier": 1.08, "ride_height_adjustment": 2.5, "tire_pressure_adjustment": -0.05},
         }
-    
-    def _load_setup_constraints(self) -> Dict[str, Tuple[float, float]]:
-        """Load setup parameter constraints"""
+
+    @staticmethod
+    def _load_setup_constraints() -> Dict[str, Tuple[float, float]]:
         return {
-            "ride_height": (60, 80),  # mm
-            "front_wing_angle": (0, 15),  # degrees
-            "rear_wing_angle": (0, 20),  # degrees
-            "brake_bias": (50, 70),  # percentage
-            "diff_preload": (0, 100),  # Nm
-            "diff_power": (0, 100),  # percentage
-            "diff_coast": (0, 100),  # percentage
-            "front_arb": (0, 100),  # percentage
-            "rear_arb": (0, 100),  # percentage
-            "front_spring": (0, 100),  # percentage
-            "rear_spring": (0, 100),  # percentage
+            "ride_height": (60.0, 85.0),
+            "front_wing_angle": (0.0, 15.0),
+            "rear_wing_angle": (0.0, 20.0),
+            "brake_bias": (50.0, 70.0),
+            "diff_preload": (0.0, 100.0),
+            "diff_power": (0.0, 100.0),
+            "diff_coast": (0.0, 100.0),
+            "front_arb": (0.0, 100.0),
+            "rear_arb": (0.0, 100.0),
+            "front_spring": (0.0, 100.0),
+            "rear_spring": (0.0, 100.0),
         }
-    
+
     def recommend_setup(
         self,
         driver_preferences: DriverPreferences,
         track_profile: TrackProfile,
-        weather: WeatherData
+        weather: WeatherData,
     ) -> Dict[str, Any]:
-        """
-        Recommend optimal car setup
-        
-        Args:
-            driver_preferences: Driver setup preferences
-            track_profile: Track characteristics
-            weather: Weather conditions
-            
-        Returns:
-            Recommended setup configuration
-        """
-        # Get weather effects
-        weather_effects = self.weather_effects[weather.condition]
-        
-        # Calculate base setup based on track type
-        base_setup = self._calculate_base_setup(track_profile, weather_effects)
-        
-        # Adjust for driver preferences
-        adjusted_setup = self._adjust_for_driver_preferences(
-            base_setup, driver_preferences
-        )
-        
-        # Optimize using Bayesian optimization
-        optimized_setup = self._optimize_setup(
-            adjusted_setup, track_profile, weather, driver_preferences
-        )
-        
-        # Calculate confidence and reasoning
-        confidence = self._calculate_confidence(
-            optimized_setup, track_profile, weather, driver_preferences
-        )
-        
-        reasoning = self._generate_reasoning(
-            optimized_setup, track_profile, weather, driver_preferences
-        )
-        
+        self._validate_inputs(driver_preferences, track_profile, weather)
+        target = self._calculate_target_setup(track_profile, weather, driver_preferences)
+        optimized, objective_value = self._optimize_setup(target, track_profile, weather, driver_preferences)
+        confidence = self._calculate_confidence(objective_value, driver_preferences)
         return {
-            "ride_height": optimized_setup.ride_height,
-            "front_wing_angle": optimized_setup.front_wing_angle,
-            "rear_wing_angle": optimized_setup.rear_wing_angle,
-            "diff_settings": optimized_setup.diff_settings,
-            "brake_bias": optimized_setup.brake_bias,
-            "suspension_settings": optimized_setup.suspension_settings,
-            "tire_pressures": optimized_setup.tire_pressures,
+            "ride_height": optimized.ride_height,
+            "front_wing_angle": optimized.front_wing_angle,
+            "rear_wing_angle": optimized.rear_wing_angle,
+            "diff_settings": optimized.diff_settings,
+            "brake_bias": optimized.brake_bias,
+            "suspension_settings": optimized.suspension_settings,
+            "tire_pressures": optimized.tire_pressures,
             "confidence": confidence,
-            "reasoning": reasoning
+            "reasoning": self._generate_reasoning(optimized, track_profile, weather),
+            "optimization_method": "Optuna TPESampler",
+            "trials": self.n_trials,
+            "objective_value": objective_value,
+            "model_scope": "heuristic setup search; not a vehicle-dynamics simulator",
         }
-    
-    def _calculate_base_setup(
-        self,
+
+    @staticmethod
+    def _validate_inputs(
+        driver_preferences: DriverPreferences,
         track_profile: TrackProfile,
-        weather_effects: Dict[str, float]
-    ) -> SetupConfiguration:
-        """Calculate base setup based on track characteristics"""
-        
-        # Ride height based on track type and weather
-        base_ride_height = 70.0  # mm
-        if track_profile.track_type == TrackType.HIGH_SPEED:
-            base_ride_height = 65.0
-        elif track_profile.track_type == TrackType.TECHNICAL:
-            base_ride_height = 75.0
-        
-        ride_height = base_ride_height + weather_effects["ride_height_adjustment"]
-        
-        # Wing angles based on downforce requirement
-        downforce_req = track_profile.downforce_requirement * weather_effects["downforce_multiplier"]
-        
-        if downforce_req > 0.8:
-            front_wing = 12.0
-            rear_wing = 16.0
-        elif downforce_req > 0.6:
-            front_wing = 8.0
-            rear_wing = 12.0
-        else:
-            front_wing = 4.0
-            rear_wing = 8.0
-        
-        # Differential settings based on track type
-        if track_profile.track_type == TrackType.TECHNICAL:
-            diff_settings = {
-                "preload": 60,
-                "power": 80,
-                "coast": 40
-            }
-        elif track_profile.track_type == TrackType.HIGH_SPEED:
-            diff_settings = {
-                "preload": 40,
-                "power": 60,
-                "coast": 60
-            }
-        else:  # MIXED
-            diff_settings = {
-                "preload": 50,
-                "power": 70,
-                "coast": 50
-            }
-        
-        # Brake bias based on track characteristics
-        if track_profile.corners > 20:
-            brake_bias = 65  # More rear bias for technical tracks
-        else:
-            brake_bias = 58  # More front bias for high-speed tracks
-        
-        # Suspension settings
-        if track_profile.track_type == TrackType.TECHNICAL:
-            suspension = {
-                "front_arb": 70,
-                "rear_arb": 60,
-                "front_spring": 80,
-                "rear_spring": 70
-            }
-        elif track_profile.track_type == TrackType.HIGH_SPEED:
-            suspension = {
-                "front_arb": 50,
-                "rear_arb": 40,
-                "front_spring": 60,
-                "rear_spring": 50
-            }
-        else:
-            suspension = {
-                "front_arb": 60,
-                "rear_arb": 50,
-                "front_spring": 70,
-                "rear_spring": 60
-            }
-        
-        # Tire pressures
-        base_pressure = 1.2  # bar
-        pressure_adjustment = weather_effects["tire_pressure_adjustment"]
-        
-        tire_pressures = {
-            "front_left": base_pressure + pressure_adjustment,
-            "front_right": base_pressure + pressure_adjustment,
-            "rear_left": base_pressure + pressure_adjustment,
-            "rear_right": base_pressure + pressure_adjustment
-        }
-        
-        return SetupConfiguration(
-            ride_height=ride_height,
-            front_wing_angle=front_wing,
-            rear_wing_angle=rear_wing,
-            diff_settings=diff_settings,
-            brake_bias=brake_bias,
-            suspension_settings=suspension,
-            tire_pressures=tire_pressures
-        )
-    
-    def _adjust_for_driver_preferences(
+        weather: WeatherData,
+    ) -> None:
+        if track_profile.track_length <= 0 or track_profile.corners <= 0:
+            raise ValueError("track_length and corners must be positive")
+        if not 0.0 <= track_profile.downforce_requirement <= 1.0:
+            raise ValueError("downforce_requirement must be between 0 and 1")
+        if not 0.0 <= driver_preferences.risk_tolerance <= 1.0:
+            raise ValueError("risk_tolerance must be between 0 and 1")
+        if not 0.0 <= driver_preferences.tire_management <= 1.0:
+            raise ValueError("tire_management must be between 0 and 1")
+        if not 0.0 <= weather.humidity <= 100.0:
+            raise ValueError("humidity must be between 0 and 100")
+
+    def _calculate_target_setup(
         self,
-        base_setup: SetupConfiguration,
-        driver_preferences: DriverPreferences
+        track: TrackProfile,
+        weather: WeatherData,
+        driver: DriverPreferences,
     ) -> SetupConfiguration:
-        """Adjust setup based on driver preferences"""
-        adjusted_setup = SetupConfiguration(
-            ride_height=base_setup.ride_height,
-            front_wing_angle=base_setup.front_wing_angle,
-            rear_wing_angle=base_setup.rear_wing_angle,
-            diff_settings=base_setup.diff_settings.copy(),
-            brake_bias=base_setup.brake_bias,
-            suspension_settings=base_setup.suspension_settings.copy(),
-            tire_pressures=base_setup.tire_pressures.copy()
+        weather_effects = self.weather_effects[weather.condition]
+        downforce = float(np.clip(track.downforce_requirement * weather_effects["downforce_multiplier"], 0.0, 1.0))
+
+        ride_height = 70.0
+        if track.track_type == TrackType.HIGH_SPEED:
+            ride_height -= 4.0
+        elif track.track_type in (TrackType.TECHNICAL, TrackType.LOW_SPEED):
+            ride_height += 4.0
+        ride_height += weather_effects["ride_height_adjustment"]
+
+        front_wing = 3.0 + 10.0 * downforce
+        rear_wing = 5.0 + 13.0 * downforce
+        brake_bias = 58.0 + min(5.0, track.low_speed_sections * 0.20)
+
+        diff = {
+            "preload": 45.0 + 15.0 * (track.low_speed_sections / max(1, track.corners)),
+            "power": 60.0 + 15.0 * driver.risk_tolerance,
+            "coast": 55.0 - 10.0 * driver.risk_tolerance,
+        }
+        suspension = {
+            "front_arb": 50.0 + 20.0 * downforce,
+            "rear_arb": 45.0 + 15.0 * downforce,
+            "front_spring": 55.0 + 20.0 * (track.high_speed_sections / max(1, track.corners)),
+            "rear_spring": 50.0 + 15.0 * (track.high_speed_sections / max(1, track.corners)),
+        }
+
+        pressure = 1.20 + weather_effects["tire_pressure_adjustment"]
+        pressures = {corner: pressure for corner in ("front_left", "front_right", "rear_left", "rear_right")}
+
+        if driver.preferred_ride_height is not None:
+            ride_height = driver.preferred_ride_height
+        if driver.preferred_wing_angles:
+            front_wing = driver.preferred_wing_angles.get("front", front_wing)
+            rear_wing = driver.preferred_wing_angles.get("rear", rear_wing)
+        if driver.preferred_diff_settings:
+            for key in diff:
+                if key in driver.preferred_diff_settings:
+                    diff[key] = driver.preferred_diff_settings[key]
+
+        return SetupConfiguration(
+            ride_height=float(np.clip(ride_height, *self.setup_constraints["ride_height"])),
+            front_wing_angle=float(np.clip(front_wing, *self.setup_constraints["front_wing_angle"])),
+            rear_wing_angle=float(np.clip(rear_wing, *self.setup_constraints["rear_wing_angle"])),
+            diff_settings={key: float(np.clip(value, 0.0, 100.0)) for key, value in diff.items()},
+            brake_bias=float(np.clip(brake_bias, *self.setup_constraints["brake_bias"])),
+            suspension_settings={key: float(np.clip(value, 0.0, 100.0)) for key, value in suspension.items()},
+            tire_pressures=pressures,
         )
-        
-        # Adjust for preferred ride height
-        if driver_preferences.preferred_ride_height:
-            adjusted_setup.ride_height = driver_preferences.preferred_ride_height
-        
-        # Adjust for preferred wing angles
-        if driver_preferences.preferred_wing_angles:
-            if "front" in driver_preferences.preferred_wing_angles:
-                adjusted_setup.front_wing_angle = driver_preferences.preferred_wing_angles["front"]
-            if "rear" in driver_preferences.preferred_wing_angles:
-                adjusted_setup.rear_wing_angle = driver_preferences.preferred_wing_angles["rear"]
-        
-        # Adjust for preferred diff settings
-        if driver_preferences.preferred_diff_settings:
-            for key, value in driver_preferences.preferred_diff_settings.items():
-                if key in adjusted_setup.diff_settings:
-                    adjusted_setup.diff_settings[key] = value
-        
-        # Adjust for risk tolerance
-        if driver_preferences.risk_tolerance > 0.7:
-            # More aggressive setup
-            adjusted_setup.front_wing_angle += 2.0
-            adjusted_setup.rear_wing_angle += 2.0
-            adjusted_setup.diff_settings["power"] += 10
-        elif driver_preferences.risk_tolerance < 0.3:
-            # More conservative setup
-            adjusted_setup.front_wing_angle -= 2.0
-            adjusted_setup.rear_wing_angle -= 2.0
-            adjusted_setup.diff_settings["power"] -= 10
-        
-        return adjusted_setup
-    
+
+    def _objective(
+        self,
+        candidate: SetupConfiguration,
+        target: SetupConfiguration,
+        track: TrackProfile,
+        weather: WeatherData,
+        driver: DriverPreferences,
+    ) -> float:
+        # Normalised distance from a domain-informed target.
+        loss = 0.0
+        loss += ((candidate.ride_height - target.ride_height) / 8.0) ** 2
+        loss += ((candidate.front_wing_angle - target.front_wing_angle) / 4.0) ** 2
+        loss += ((candidate.rear_wing_angle - target.rear_wing_angle) / 5.0) ** 2
+        loss += ((candidate.brake_bias - target.brake_bias) / 5.0) ** 2
+        for key in target.diff_settings:
+            loss += 0.25 * ((candidate.diff_settings[key] - target.diff_settings[key]) / 20.0) ** 2
+        for key in target.suspension_settings:
+            loss += 0.15 * ((candidate.suspension_settings[key] - target.suspension_settings[key]) / 20.0) ** 2
+
+        # Extra penalties encode broad trade-offs rather than claiming physical fidelity.
+        if track.track_type == TrackType.HIGH_SPEED:
+            loss += max(0.0, candidate.rear_wing_angle - 14.0) * 0.03
+        if weather.condition == WeatherCondition.WET:
+            loss += max(0.0, 73.0 - candidate.ride_height) * 0.05
+        if driver.tire_management < 0.4:
+            loss += max(0.0, candidate.diff_settings["power"] - 75.0) * 0.02
+        return float(loss)
+
     def _optimize_setup(
         self,
-        base_setup: SetupConfiguration,
-        track_profile: TrackProfile,
+        target: SetupConfiguration,
+        track: TrackProfile,
         weather: WeatherData,
-        driver_preferences: DriverPreferences
-    ) -> SetupConfiguration:
-        """Optimize setup using Bayesian optimization"""
-        # Mock optimization - in production would use scikit-optimize or similar
-        optimized_setup = SetupConfiguration(
-            ride_height=base_setup.ride_height + random.uniform(-2, 2),
-            front_wing_angle=base_setup.front_wing_angle + random.uniform(-1, 1),
-            rear_wing_angle=base_setup.rear_wing_angle + random.uniform(-1, 1),
-            diff_settings={
-                "preload": base_setup.diff_settings["preload"] + random.uniform(-5, 5),
-                "power": base_setup.diff_settings["power"] + random.uniform(-5, 5),
-                "coast": base_setup.diff_settings["coast"] + random.uniform(-5, 5)
-            },
-            brake_bias=base_setup.brake_bias + random.uniform(-2, 2),
-            suspension_settings={
-                "front_arb": base_setup.suspension_settings["front_arb"] + random.uniform(-5, 5),
-                "rear_arb": base_setup.suspension_settings["rear_arb"] + random.uniform(-5, 5),
-                "front_spring": base_setup.suspension_settings["front_spring"] + random.uniform(-5, 5),
-                "rear_spring": base_setup.suspension_settings["rear_spring"] + random.uniform(-5, 5)
-            },
-            tire_pressures=base_setup.tire_pressures.copy()
+        driver: DriverPreferences,
+    ) -> Tuple[SetupConfiguration, float]:
+        sampler = optuna.samplers.TPESampler(seed=self.seed)
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def objective(trial: optuna.Trial) -> float:
+            c = self.setup_constraints
+            candidate = SetupConfiguration(
+                ride_height=trial.suggest_float("ride_height", *c["ride_height"]),
+                front_wing_angle=trial.suggest_float("front_wing_angle", *c["front_wing_angle"]),
+                rear_wing_angle=trial.suggest_float("rear_wing_angle", *c["rear_wing_angle"]),
+                diff_settings={
+                    "preload": trial.suggest_float("diff_preload", *c["diff_preload"]),
+                    "power": trial.suggest_float("diff_power", *c["diff_power"]),
+                    "coast": trial.suggest_float("diff_coast", *c["diff_coast"]),
+                },
+                brake_bias=trial.suggest_float("brake_bias", *c["brake_bias"]),
+                suspension_settings={
+                    "front_arb": trial.suggest_float("front_arb", *c["front_arb"]),
+                    "rear_arb": trial.suggest_float("rear_arb", *c["rear_arb"]),
+                    "front_spring": trial.suggest_float("front_spring", *c["front_spring"]),
+                    "rear_spring": trial.suggest_float("rear_spring", *c["rear_spring"]),
+                },
+                tire_pressures=target.tire_pressures.copy(),
+            )
+            return self._objective(candidate, target, track, weather, driver)
+
+        # Seed the search with the calculated target, then let TPE explore around it.
+        study.enqueue_trial(
+            {
+                "ride_height": target.ride_height,
+                "front_wing_angle": target.front_wing_angle,
+                "rear_wing_angle": target.rear_wing_angle,
+                "diff_preload": target.diff_settings["preload"],
+                "diff_power": target.diff_settings["power"],
+                "diff_coast": target.diff_settings["coast"],
+                "brake_bias": target.brake_bias,
+                "front_arb": target.suspension_settings["front_arb"],
+                "rear_arb": target.suspension_settings["rear_arb"],
+                "front_spring": target.suspension_settings["front_spring"],
+                "rear_spring": target.suspension_settings["rear_spring"],
+            }
         )
-        
-        # Ensure values are within constraints
-        constraints = self.setup_constraints
-        optimized_setup.ride_height = np.clip(optimized_setup.ride_height, *constraints["ride_height"])
-        optimized_setup.front_wing_angle = np.clip(optimized_setup.front_wing_angle, *constraints["front_wing_angle"])
-        optimized_setup.rear_wing_angle = np.clip(optimized_setup.rear_wing_angle, *constraints["rear_wing_angle"])
-        optimized_setup.brake_bias = np.clip(optimized_setup.brake_bias, *constraints["brake_bias"])
-        
-        for key in optimized_setup.diff_settings:
-            optimized_setup.diff_settings[key] = np.clip(
-                optimized_setup.diff_settings[key], 0, 100
-            )
-        
-        for key in optimized_setup.suspension_settings:
-            optimized_setup.suspension_settings[key] = np.clip(
-                optimized_setup.suspension_settings[key], 0, 100
-            )
-        
-        return optimized_setup
-    
-    def _calculate_confidence(
-        self,
-        setup: SetupConfiguration,
-        track_profile: TrackProfile,
-        weather: WeatherData,
-        driver_preferences: DriverPreferences
-    ) -> float:
-        """Calculate confidence in setup recommendation"""
-        confidence = 0.7  # Base confidence
-        
-        # Track type match
-        if track_profile.track_type == TrackType.TECHNICAL and setup.rear_wing_angle > 12:
-            confidence += 0.1
-        elif track_profile.track_type == TrackType.HIGH_SPEED and setup.rear_wing_angle < 10:
-            confidence += 0.1
-        
-        # Weather condition match
-        if weather.condition == WeatherCondition.WET and setup.ride_height > 75:
-            confidence += 0.1
-        elif weather.condition == WeatherCondition.DRY and 65 < setup.ride_height < 75:
-            confidence += 0.1
-        
-        # Driver preference match
-        if driver_preferences.preferred_ride_height:
-            if abs(setup.ride_height - driver_preferences.preferred_ride_height) < 5:
-                confidence += 0.1
-        
-        return min(0.95, confidence)
-    
-    def _generate_reasoning(
-        self,
-        setup: SetupConfiguration,
-        track_profile: TrackProfile,
-        weather: WeatherData,
-        driver_preferences: DriverPreferences
-    ) -> str:
-        """Generate reasoning for setup choices"""
-        reasoning = f"Setup optimized for {track_profile.track_name} ({track_profile.track_type.value} track). "
-        
-        # Ride height reasoning
-        if setup.ride_height > 75:
-            reasoning += f"High ride height ({setup.ride_height:.1f}mm) for stability and {weather.condition.value} conditions. "
-        elif setup.ride_height < 65:
-            reasoning += f"Low ride height ({setup.ride_height:.1f}mm) for aerodynamic efficiency on high-speed sections. "
-        else:
-            reasoning += f"Balanced ride height ({setup.ride_height:.1f}mm) for mixed track characteristics. "
-        
-        # Wing angle reasoning
-        total_downforce = setup.front_wing_angle + setup.rear_wing_angle
-        if total_downforce > 25:
-            reasoning += f"High downforce configuration ({setup.front_wing_angle:.1f}° front, {setup.rear_wing_angle:.1f}° rear) for technical corners. "
-        elif total_downforce < 15:
-            reasoning += f"Low downforce configuration ({setup.front_wing_angle:.1f}° front, {setup.rear_wing_angle:.1f}° rear) for high-speed efficiency. "
-        else:
-            reasoning += f"Balanced downforce configuration ({setup.front_wing_angle:.1f}° front, {setup.rear_wing_angle:.1f}° rear) for mixed requirements. "
-        
-        # Differential reasoning
-        if setup.diff_settings["power"] > 70:
-            reasoning += "Aggressive differential settings for maximum traction. "
-        elif setup.diff_settings["power"] < 50:
-            reasoning += "Conservative differential settings for stability. "
-        else:
-            reasoning += "Balanced differential settings for mixed conditions. "
-        
-        # Weather considerations
-        if weather.condition == WeatherCondition.WET:
-            reasoning += "Wet weather adjustments: increased downforce and higher ride height. "
-        elif weather.condition == WeatherCondition.INTERMEDIATE:
-            reasoning += "Intermediate weather adjustments: moderate downforce increase. "
-        
-        return reasoning
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=False)
+        p = study.best_params
+        optimized = SetupConfiguration(
+            ride_height=float(p["ride_height"]),
+            front_wing_angle=float(p["front_wing_angle"]),
+            rear_wing_angle=float(p["rear_wing_angle"]),
+            diff_settings={"preload": float(p["diff_preload"]), "power": float(p["diff_power"]), "coast": float(p["diff_coast"])},
+            brake_bias=float(p["brake_bias"]),
+            suspension_settings={
+                "front_arb": float(p["front_arb"]),
+                "rear_arb": float(p["rear_arb"]),
+                "front_spring": float(p["front_spring"]),
+                "rear_spring": float(p["rear_spring"]),
+            },
+            tire_pressures=target.tire_pressures.copy(),
+        )
+        return optimized, float(study.best_value)
+
+    @staticmethod
+    def _calculate_confidence(objective_value: float, driver: DriverPreferences) -> float:
+        preference_bonus = 0.05 if any(
+            x is not None
+            for x in (driver.preferred_ride_height, driver.preferred_wing_angles, driver.preferred_diff_settings)
+        ) else 0.0
+        return float(np.clip(0.82 - min(objective_value, 2.0) * 0.08 + preference_bonus, 0.55, 0.90))
+
+    @staticmethod
+    def _generate_reasoning(setup: SetupConfiguration, track: TrackProfile, weather: WeatherData) -> str:
+        return (
+            f"TPE search targeted a {track.track_type.value} setup for {track.track_name}. "
+            f"The selected configuration uses {setup.front_wing_angle:.1f}°/{setup.rear_wing_angle:.1f}° front/rear wing, "
+            f"{setup.ride_height:.1f} mm ride height and {setup.brake_bias:.1f}% brake bias. "
+            f"Weather mode is {weather.condition.value}. Values are heuristic engineering recommendations and require simulator/track validation."
+        )
 
 
-# Global optimizer instance
-_setup_optimizer = None
+_setup_optimizer: Optional[SetupOptimizer] = None
+
 
 def get_setup_optimizer() -> SetupOptimizer:
-    """Get or create setup optimizer instance"""
     global _setup_optimizer
     if _setup_optimizer is None:
         _setup_optimizer = SetupOptimizer()
     return _setup_optimizer
 
+
 def recommend_setup(
     driver_preferences: Dict[str, Any],
     track_profile: Dict[str, Any],
-    weather: Dict[str, Any]
+    weather: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Recommend optimal car setup
-    
-    Args:
-        driver_preferences: Driver setup preferences
-        track_profile: Track characteristics
-        weather: Weather conditions
-        
-    Returns:
-        Recommended setup configuration
-    """
     optimizer = get_setup_optimizer()
-    
-    # Convert dict inputs to proper objects
-    driver_prefs = DriverPreferences(**driver_preferences)
-    track_prof = TrackProfile(**track_profile)
-    weather_data = WeatherData(**weather)
-    
-    return optimizer.recommend_setup(driver_prefs, track_prof, weather_data)
 
+    driver_data = dict(driver_preferences)
+    track_data = dict(track_profile)
+    weather_data = dict(weather)
 
-# Example usage and testing
-if __name__ == "__main__":
-    print("🏁 Setup Recommender Test")
-    print("=" * 50)
-    
-    optimizer = get_setup_optimizer()
-    
-    # Test cases
-    test_cases = [
-        {
-            "driver_preferences": DriverPreferences(
-                preferred_ride_height=72.0,
-                risk_tolerance=0.7,
-                tire_management=0.6
-            ),
-            "track_profile": optimizer.track_profiles["monaco"],
-            "weather": WeatherData(
-                condition=WeatherCondition.DRY,
-                temperature=25.0,
-                humidity=60.0
-            )
-        },
-        {
-            "driver_preferences": DriverPreferences(
-                preferred_ride_height=68.0,
-                risk_tolerance=0.4,
-                tire_management=0.8
-            ),
-            "track_profile": optimizer.track_profiles["silverstone"],
-            "weather": WeatherData(
-                condition=WeatherCondition.WET,
-                temperature=18.0,
-                humidity=85.0
-            )
-        }
-    ]
-    
-    for i, case in enumerate(test_cases, 1):
-        print(f"\n🔧 Test Case {i}: {case['track_profile'].track_name}")
-        print(f"   Weather: {case['weather'].condition.value}")
-        print(f"   Driver Risk Tolerance: {case['driver_preferences'].risk_tolerance}")
-        
-        result = optimizer.recommend_setup(
-            case['driver_preferences'],
-            case['track_profile'],
-            case['weather']
-        )
-        
-        print(f"   📋 Recommended Setup:")
-        print(f"      • Ride Height: {result['ride_height']:.1f}mm")
-        print(f"      • Front Wing: {result['front_wing_angle']:.1f}°")
-        print(f"      • Rear Wing: {result['rear_wing_angle']:.1f}°")
-        print(f"      • Brake Bias: {result['brake_bias']:.1f}%")
-        print(f"      • Diff Settings: {result['diff_settings']}")
-        print(f"      • Confidence: {result['confidence']:.2f}")
-        print(f"      • Reasoning: {result['reasoning'][:100]}...")
-        print("-" * 50) 
+    if isinstance(track_data.get("track_type"), str):
+        track_data["track_type"] = TrackType(track_data["track_type"])
+    if isinstance(weather_data.get("condition"), str):
+        weather_data["condition"] = WeatherCondition(weather_data["condition"])
+
+    return optimizer.recommend_setup(
+        DriverPreferences(**driver_data),
+        TrackProfile(**track_data),
+        WeatherData(**weather_data),
+    )
