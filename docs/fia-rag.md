@@ -1,29 +1,46 @@
 # FIA Regulations RAG
 
-This component answers natural-language questions using retrieved evidence from FIA regulation PDFs. It is intentionally split into independent ingestion/indexing, retrieval, and generation stages so chunking, retrieval depth, thresholds, and prompts can be changed and evaluated separately.
+This component answers natural-language questions using retrieved evidence from FIA Formula 1 regulation PDFs. Ingestion/indexing, retrieval and answer generation are deliberately separate so chunking, retrieval depth, thresholds and prompts can be inspected and changed independently.
 
 ## Pipeline
 
 1. `PyPDFLoader` extracts page text and page metadata from each PDF in `FIA_DOCS_PATH`.
 2. `RecursiveCharacterTextSplitter` creates overlapping chunks.
 3. `OpenAIEmbeddings` generates one vector per chunk.
-4. Qdrant stores vectors together with chunk text, source filename, page number, and chunk ID.
-5. `retrieve()` embeds the question and returns the top-k Qdrant matches without calling the answer model.
-6. `generate_answer()` receives only those passages. It must answer from them, cite source labels such as `[S1]`, preserve regulation article/section numbers, and decline when the retrieved evidence is insufficient.
-7. `query()` combines retrieval and generation and returns the answer together with retrieval scores and source metadata for inspection.
+4. Qdrant stores each vector with chunk text, source filename, page number and chunk ID.
+5. `retrieve()` embeds a question and returns top-k Qdrant matches without calling the answer model.
+6. `generate_answer()` receives only the retrieved passages. The prompt requires source labels such as `[S1]`, exact article/section references from the evidence and refusal when evidence is insufficient.
+7. `query()` combines retrieval and generation and exposes the answer, grounding state, evidence-strength proxy, retrieval score and retrieved source metadata.
 
-## Setup
+## Obtain the FIA documents
 
-The repository does not commit FIA PDFs because `data/` is ignored. Add official FIA regulation PDFs locally:
+FIA Publications are third-party copyrighted material and are not redistributed by this repository. `data/` is git-ignored.
 
-```text
-data/
-└── fia_docs/
-    ├── sporting_regulations.pdf
-    └── technical_regulations.pdf
+For local/private use, discover and download the current official 2026 Formula 1 regulation Sections A-F directly from FIA:
+
+```bash
+python scripts/fetch_fia_regulations.py
 ```
 
-Copy `.env.example` to `.env` or export the required variables. At minimum:
+Files are written to:
+
+```text
+data/fia_docs/
+```
+
+The downloader also writes `manifest.json` containing the official category URL, source URL, final download URL, byte count and SHA-256 digest for every downloaded PDF.
+
+To check the official FIA links without downloading the documents:
+
+```bash
+python scripts/fetch_fia_regulations.py --dry-run
+```
+
+The repository CI performs this discovery check so an FIA page-layout change becomes visible.
+
+## Configure the RAG system
+
+Copy `.env.example` to `.env` or export the settings. At minimum:
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -32,10 +49,10 @@ export FIA_DOCS_PATH="data/fia_docs"
 
 Qdrant can run in either mode:
 
-- **Local persistent mode:** leave `QDRANT_URL` empty. The client stores its collection under `QDRANT_PATH` (default `.qdrant`).
-- **Qdrant server/cloud:** set `QDRANT_URL` and, when required, `QDRANT_API_KEY`.
+- **Local persistent mode:** leave `QDRANT_URL` empty; data is stored under `QDRANT_PATH` (default `.qdrant`).
+- **Qdrant server/cloud:** set `QDRANT_URL` and, if required, `QDRANT_API_KEY`.
 
-## Run the tests
+## Tests
 
 Unit tests do not require an OpenAI key or real FIA PDFs:
 
@@ -44,13 +61,13 @@ pip install -r requirements-rag.txt
 python -m pytest -q tests/test_fia_rag_agent.py
 ```
 
-The end-to-end smoke test does require the PDFs and an OpenAI key:
+The real external smoke test requires downloaded FIA PDFs and an OpenAI key:
 
 ```bash
 python scripts/check_fia_rag.py
 ```
 
-It verifies initialization and indexing, top-k retrieval, source/page metadata, grounded answer generation, and source-label citations.
+It exercises PDF parsing, indexing, question embedding, top-k retrieval, page/source metadata and grounded answer generation.
 
 ## API
 
@@ -60,7 +77,7 @@ Start the application:
 python app/main.py
 ```
 
-Inspect RAG configuration/status:
+Inspect RAG status:
 
 ```bash
 curl http://localhost:8000/api/fia/status
@@ -74,16 +91,19 @@ curl -X POST http://localhost:8000/api/fia/query \
   -d '{"question":"What do the regulations say about an unsafe release?"}'
 ```
 
-The response includes:
+A successful detailed response includes:
 
 - `answer`
 - `grounded`
+- `confidence` (an evidence-strength proxy from the top retrieval similarity, not a calibrated correctness probability)
 - `top_retrieval_score`
-- `retrieved_passages` with source, page, score, text, and chunk ID
+- `retrieved_passages` with source, page, score, text and chunk ID
 - `referenced_rules`
 - `citations`
 
-## Main tuning controls
+When the API key, documents or external dependencies are unavailable, `/api/fia/query` returns HTTP 503 instead of silently returning a mock answer.
+
+## Tuning controls
 
 - `FIA_RAG_CHUNK_SIZE`
 - `FIA_RAG_CHUNK_OVERLAP`
@@ -92,4 +112,4 @@ The response includes:
 - `FIA_RAG_EMBEDDING_MODEL`
 - `FIA_RAG_MODEL`
 
-Because retrieval is exposed through `retrieve_fia_passages()`, retrieval quality can be evaluated without generation. This is useful for testing different chunk sizes, overlaps, top-k values, embedding models, and score thresholds before changing the prompting layer.
+Because retrieval is exposed independently through `retrieve_fia_passages()`, retrieval quality can be evaluated without answer generation. This makes it possible to compare chunk sizes, overlaps, top-k values, embedding models and score thresholds before changing the generation prompt.
