@@ -1,7 +1,11 @@
 # Minimal dependencies for the FIA regulations RAG component and its tests.
 langchain==0.0.350
+langchain-community==0.0.20
+langchain-core==0.1.23
 langchain-openai==0.0.2
+langsmith==0.0.87
 openai==1.6.1
 qdrant-client==1.7.0
 pypdf==3.17.4
+packaging==23.2
 pytest==7.4.3
