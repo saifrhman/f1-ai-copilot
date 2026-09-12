@@ -1,44 +1,55 @@
 #!/usr/bin/env python3
-"""
-F1 AI Copilot - Main Application
-FastAPI backend for Formula 1 race engineering and strategy optimization
-"""
+"""FastAPI entry point for F1 AI Copilot."""
 
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Dict, List, Any, Optional
-import uvicorn
 
-from core_modules.strategy_optimizer.strategy_engine import (
-    generate_strategy, DriverProfile, CarStatus, TireData, RaceState, Competitor
-)
-from core_modules.rule_checker.fia_rag_agent import (
-    get_fia_knowledge_base,
-    query_fia_regulations_detailed,
-)
-from core_modules.rule_checker.penalty_predictor import predict_penalty
-from core_modules.llm_query.natural_query import process_natural_query
-from core_modules.driver_emotion.emotion_classifier import classify_emotion
+from core_modules.driver_emotion.emotion_classifier import classify_emotion_detailed
 from core_modules.ghost_car.ghost_car_visualizer import generate_ghost_comparison
+from core_modules.llm_query.natural_query import process_natural_query
+from core_modules.rule_checker.fia_rag_agent import get_fia_knowledge_base, query_fia_regulations_detailed
+from core_modules.rule_checker.penalty_predictor import predict_penalty
 from core_modules.setup_optimizer.setup_recommender import recommend_setup
+from core_modules.strategy_optimizer.strategy_engine import (
+    CarStatus,
+    Competitor,
+    DriverProfile,
+    RaceState,
+    TireCompound,
+    TireData,
+    WeatherCondition,
+    generate_strategy,
+)
+
 
 app = FastAPI(
     title="F1 AI Copilot",
-    description="AI-powered Formula 1 race engineering and strategy optimization system",
-    version="1.0.0"
+    description="Formula 1 analysis demo with strategy, FIA RAG, setup, telemetry and radio-analysis modules",
+    version="1.1.0",
 )
 
-# CORS middleware
+cors_raw = os.getenv("CORS_ORIGINS", "*")
+cors_origins = [value.strip() for value in cors_raw.split(",") if value.strip()]
+allow_credentials = cors_origins != ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models for API requests/responses
+Path("outputs").mkdir(parents=True, exist_ok=True)
+app.mount("/artifacts", StaticFiles(directory="outputs", check_dir=False), name="artifacts")
+
+
 class StrategyRequest(BaseModel):
     telemetry: Dict[str, Any]
     car_status: Dict[str, Any]
@@ -47,8 +58,10 @@ class StrategyRequest(BaseModel):
     race_state: Dict[str, Any]
     competition: List[Dict[str, Any]]
 
+
 class FIAQueryRequest(BaseModel):
     question: str
+
 
 class PenaltyRequest(BaseModel):
     incident_type: str
@@ -56,169 +69,202 @@ class PenaltyRequest(BaseModel):
     intent: str
     driver_history: Optional[Dict[str, Any]] = None
 
+
 class NaturalQueryRequest(BaseModel):
     query: str
     context: Optional[Dict[str, Any]] = None
 
+
 class EmotionRequest(BaseModel):
-    audio_file: str  # Base64 encoded audio or file path
+    audio_file: str
+    transcribe: bool = False
+
 
 class GhostCarRequest(BaseModel):
     lap1_telemetry: Dict[str, Any]
     lap2_telemetry: Dict[str, Any]
-    track_section: str
+    track_section: str = "monaco"
+
 
 class SetupRequest(BaseModel):
     driver_preferences: Dict[str, Any]
     track_profile: Dict[str, Any]
     weather: Dict[str, Any]
 
+
 @app.get("/")
-async def root():
-    """Root endpoint"""
+async def root() -> Dict[str, Any]:
     return {
         "message": "F1 AI Copilot API",
-        "version": "1.0.0",
-        "status": "operational"
+        "version": app.version,
+        "status": "operational",
+        "docs": "/docs",
     }
+
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
+async def health_check() -> Dict[str, Any]:
+    fia_status = get_fia_knowledge_base().status()
+    fia_ready = bool(fia_status.get("initialized"))
     return {
-        "status": "healthy",
-        "modules": ["strategy", "fia", "emotion", "ghost", "setup"],
-        "fia_rag": get_fia_knowledge_base().status(),
+        "status": "healthy" if fia_ready else "degraded",
+        "version": app.version,
+        "modules": {
+            "strategy": "ready",
+            "fia_rag": "ready" if fia_ready else "not_configured",
+            "penalty": "ready",
+            "natural_query": "ready",
+            "emotion": "ready",
+            "ghost": "ready",
+            "setup": "ready",
+        },
+        "fia_rag": fia_status,
     }
 
+
 @app.post("/api/strategy/generate")
-async def generate_race_strategy(request: StrategyRequest):
-    """
-    Generate optimal race strategy based on current conditions
-    """
+async def generate_race_strategy(request: StrategyRequest) -> Dict[str, Any]:
     try:
-        # Convert dict inputs to proper objects
-        driver_profile = DriverProfile(**request.driver_profile)
-        car_status = CarStatus(**request.car_status)
-        race_state = RaceState(**request.race_state)
+        race_data = dict(request.race_state)
+        if isinstance(race_data.get("weather"), str):
+            race_data["weather"] = WeatherCondition(race_data["weather"])
 
-        # Convert tire data
-        tire_data = {}
-        for compound, data in request.tire_data.items():
-            tire_data[compound] = TireData(**data)
+        tyre_data: Dict[TireCompound, TireData] = {}
+        for key, raw in request.tire_data.items():
+            compound = TireCompound(key)
+            item = dict(raw)
+            raw_compound = item.get("compound", key)
+            item["compound"] = TireCompound(raw_compound) if isinstance(raw_compound, str) else raw_compound
+            if "peak_performance_window" in item:
+                item["peak_performance_window"] = tuple(item["peak_performance_window"])
+            tyre_data[compound] = TireData(**item)
 
-        # Convert competition data
-        competition = [Competitor(**comp) for comp in request.competition]
+        competitors: List[Competitor] = []
+        for raw in request.competition:
+            item = dict(raw)
+            if isinstance(item.get("tire_compound"), str):
+                item["tire_compound"] = TireCompound(item["tire_compound"])
+            competitors.append(Competitor(**item))
 
         strategies = generate_strategy(
             telemetry=request.telemetry,
-            car_status=car_status,
-            driver_profile=driver_profile,
-            tire_data=tire_data,
-            race_state=race_state,
-            competition=competition
+            car_status=CarStatus(**request.car_status),
+            driver_profile=DriverProfile(**request.driver_profile),
+            tire_data=tyre_data,
+            race_state=RaceState(**race_data),
+            competition=competitors,
         )
-
         return {
             "strategies": [
                 {
-                    "strategy_id": s.strategy_id,
-                    "projected_race_time": s.projected_race_time,
-                    "confidence_score": s.confidence_score,
-                    "risk_level": s.risk_level,
-                    "pit_stops": len(s.pit_laps),
-                    "tire_compounds": [c.value for c in s.tire_compounds],
-                    "pit_laps": s.pit_laps,
-                    "undercut_opportunities": s.undercut_opportunities,
-                    "overcut_opportunities": s.overcut_opportunities,
-                    "notes": s.notes
+                    "strategy_id": strategy.strategy_id,
+                    "projected_race_time": strategy.projected_race_time,
+                    "confidence_score": strategy.confidence_score,
+                    "risk_level": strategy.risk_level,
+                    "pit_stops": len(strategy.pit_laps),
+                    "tire_compounds": [compound.value for compound in strategy.tire_compounds],
+                    "pit_laps": strategy.pit_laps,
+                    "stint_breakdown": [
+                        {
+                            **{k: v for k, v in stint.items() if k != "tire_compound"},
+                            "tire_compound": stint["tire_compound"].value,
+                        }
+                        for stint in strategy.stint_breakdown
+                    ],
+                    "undercut_opportunities": strategy.undercut_opportunities,
+                    "overcut_opportunities": strategy.overcut_opportunities,
+                    "notes": strategy.notes,
                 }
-                for s in strategies
+                for strategy in strategies
             ]
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Strategy generation failed: {str(e)}")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid strategy input: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Strategy generation failed: {exc}") from exc
+
 
 @app.get("/api/fia/status")
-async def fia_rag_status():
-    """Return configuration and indexing status for the FIA RAG component."""
+async def fia_rag_status() -> Dict[str, Any]:
     return get_fia_knowledge_base().status()
 
+
 @app.post("/api/fia/query")
-async def query_fia_rules(request: FIAQueryRequest):
-    """Query FIA regulations and return answer plus retrieved evidence."""
+async def query_fia_rules(request: FIAQueryRequest) -> Dict[str, Any]:
     try:
         return query_fia_regulations_detailed(request.question)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"FIA query failed: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"FIA query failed: {exc}") from exc
+
 
 @app.post("/api/penalty/predict")
-async def predict_incident_penalty(request: PenaltyRequest):
-    """
-    Predict penalty for an incident based on FIA rules and precedent
-    """
+async def predict_incident_penalty(request: PenaltyRequest) -> Dict[str, Any]:
     try:
-        penalty = predict_penalty(
+        return predict_penalty(
             incident_type=request.incident_type,
             track_condition=request.track_condition,
             intent=request.intent,
-            driver_history=request.driver_history
+            driver_history=request.driver_history,
         )
-        return penalty
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Penalty prediction failed: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Penalty prediction failed: {exc}") from exc
+
 
 @app.post("/api/query/natural")
-async def process_query(request: NaturalQueryRequest):
-    """
-    Process natural language queries about race performance or regulations
-    """
+async def process_query(request: NaturalQueryRequest) -> Dict[str, Any]:
     try:
-        result = process_natural_query(request.query, request.context)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Natural query processing failed: {str(e)}")
+        return process_natural_query(request.query, request.context)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Natural query processing failed: {exc}") from exc
+
 
 @app.post("/api/emotion/classify")
-async def classify_driver_emotion(request: EmotionRequest):
-    """
-    Classify driver emotion from radio communication
-    """
+async def classify_driver_emotion(request: EmotionRequest) -> Dict[str, Any]:
     try:
-        emotion = classify_emotion(request.audio_file)
-        return {"emotion": emotion, "confidence": 0.85}  # Placeholder confidence
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Emotion classification failed: {str(e)}")
+        return classify_emotion_detailed(request.audio_file, transcribe=request.transcribe)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Emotion classification failed: {exc}") from exc
+
 
 @app.post("/api/ghost/generate")
-async def generate_ghost_car(request: GhostCarRequest):
-    """
-    Generate ghost car visualization for lap comparison
-    """
+async def generate_ghost_car(request: GhostCarRequest) -> Dict[str, Any]:
     try:
-        comparison = generate_ghost_comparison(
+        return generate_ghost_comparison(
             lap1_telemetry=request.lap1_telemetry,
             lap2_telemetry=request.lap2_telemetry,
-            track_section=request.track_section
+            track_section=request.track_section,
         )
-        return comparison
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ghost car generation failed: {str(e)}")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Ghost car generation failed: {exc}") from exc
+
 
 @app.post("/api/setup/recommend")
-async def recommend_car_setup(request: SetupRequest):
-    """
-    Recommend optimal car setup based on conditions
-    """
+async def recommend_car_setup(request: SetupRequest) -> Dict[str, Any]:
     try:
-        setup = recommend_setup(
+        return recommend_setup(
             driver_preferences=request.driver_preferences,
             track_profile=request.track_profile,
-            weather=request.weather
+            weather=request.weather,
         )
-        return setup
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Setup recommendation failed: {str(e)}")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid setup input: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Setup recommendation failed: {exc}") from exc
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
