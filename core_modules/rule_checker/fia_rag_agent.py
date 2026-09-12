@@ -66,25 +66,24 @@ class FIAKnowledgeBase:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
     ) -> None:
-        self.fia_docs_path = Path(
-            fia_docs_path or os.getenv("FIA_DOCS_PATH", "data/fia_docs")
-        )
+        self.fia_docs_path = Path(fia_docs_path or os.getenv("FIA_DOCS_PATH", "data/fia_docs"))
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        self.collection_name = collection_name or os.getenv(
-            "FIA_RAG_COLLECTION", "fia_regulations"
-        )
+        self.collection_name = collection_name or os.getenv("FIA_RAG_COLLECTION", "fia_regulations")
         self.top_k = top_k or int(os.getenv("FIA_RAG_TOP_K", "5"))
-        self.min_score = (
-            min_score
-            if min_score is not None
-            else float(os.getenv("FIA_RAG_MIN_SCORE", "0.30"))
-        )
-        self.embedding_model = os.getenv(
-            "FIA_RAG_EMBEDDING_MODEL", "text-embedding-3-small"
-        )
+        self.min_score = min_score if min_score is not None else float(os.getenv("FIA_RAG_MIN_SCORE", "0.30"))
+        self.embedding_model = os.getenv("FIA_RAG_EMBEDDING_MODEL", "text-embedding-3-small")
         self.chat_model = os.getenv("FIA_RAG_MODEL", "gpt-4o-mini")
         self.chunk_size = int(os.getenv("FIA_RAG_CHUNK_SIZE", "1000"))
         self.chunk_overlap = int(os.getenv("FIA_RAG_CHUNK_OVERLAP", "200"))
+
+        if self.top_k <= 0:
+            raise ValueError("FIA_RAG_TOP_K must be positive")
+        if not 0.0 <= self.min_score <= 1.0:
+            raise ValueError("FIA_RAG_MIN_SCORE must be between 0 and 1")
+        if self.chunk_size <= 0:
+            raise ValueError("FIA_RAG_CHUNK_SIZE must be positive")
+        if self.chunk_overlap < 0 or self.chunk_overlap >= self.chunk_size:
+            raise ValueError("FIA_RAG_CHUNK_OVERLAP must be >= 0 and smaller than chunk size")
 
         self.embeddings = None
         self.llm = None
@@ -107,19 +106,12 @@ class FIAKnowledgeBase:
         if not pdf_files:
             raise RuntimeError(
                 f"No FIA regulation PDFs found in {self.fia_docs_path}. "
-                "Add official FIA PDF files before querying the RAG system."
+                "Run scripts/fetch_fia_regulations.py before querying the RAG system."
             )
 
         try:
-            self.embeddings = OpenAIEmbeddings(
-                model=self.embedding_model,
-                openai_api_key=self.openai_api_key,
-            )
-            self.llm = ChatOpenAI(
-                model=self.chat_model,
-                openai_api_key=self.openai_api_key,
-                temperature=0,
-            )
+            self.embeddings = OpenAIEmbeddings(model=self.embedding_model, openai_api_key=self.openai_api_key)
+            self.llm = ChatOpenAI(model=self.chat_model, openai_api_key=self.openai_api_key, temperature=0)
             self.qdrant = self._make_qdrant_client()
 
             collection_exists = self._collection_exists()
@@ -141,10 +133,7 @@ class FIAKnowledgeBase:
     def _make_qdrant_client(self):
         qdrant_url = os.getenv("QDRANT_URL", "").strip()
         if qdrant_url:
-            return QdrantClient(
-                url=qdrant_url,
-                api_key=os.getenv("QDRANT_API_KEY") or None,
-            )
+            return QdrantClient(url=qdrant_url, api_key=os.getenv("QDRANT_API_KEY") or None)
         return QdrantClient(path=os.getenv("QDRANT_PATH", ".qdrant"))
 
     def _collection_exists(self) -> bool:
@@ -155,10 +144,7 @@ class FIAKnowledgeBase:
             return False
 
     def _collection_count(self) -> int:
-        result = self.qdrant.count(
-            collection_name=self.collection_name,
-            exact=True,
-        )
+        result = self.qdrant.count(collection_name=self.collection_name, exact=True)
         return int(result.count)
 
     def _load_and_chunk_documents(self, pdf_files: List[str]):
@@ -203,12 +189,7 @@ class FIAKnowledgeBase:
                 PointStruct(
                     id=chunk_id,
                     vector=vector,
-                    payload={
-                        "text": chunk.page_content,
-                        "source": source,
-                        "page": page,
-                        "chunk_id": chunk_id,
-                    },
+                    payload={"text": chunk.page_content, "source": source, "page": page, "chunk_id": chunk_id},
                 )
             )
 
@@ -225,12 +206,19 @@ class FIAKnowledgeBase:
     # -------------------------------- retrieval ---------------------------------
     def retrieve(self, question: str, top_k: Optional[int] = None) -> List[RetrievedPassage]:
         """Return top-k regulation passages without invoking the answer model."""
+        question = question.strip()
+        if not question:
+            raise ValueError("question cannot be empty")
+        requested_k = top_k or self.top_k
+        if requested_k <= 0:
+            raise ValueError("top_k must be positive")
+
         self.initialize()
         query_vector = self.embeddings.embed_query(question)
         hits = self.qdrant.search(
             collection_name=self.collection_name,
             query_vector=query_vector,
-            limit=top_k or self.top_k,
+            limit=requested_k,
             with_payload=True,
         )
 
@@ -238,9 +226,12 @@ class FIAKnowledgeBase:
         for hit in hits:
             payload = hit.payload or {}
             page = payload.get("page")
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                continue
             passages.append(
                 RetrievedPassage(
-                    text=str(payload.get("text", "")),
+                    text=text,
                     score=float(hit.score),
                     source=str(payload.get("source", "unknown")),
                     page=(int(page) + 1) if page is not None else None,
@@ -264,6 +255,9 @@ class FIAKnowledgeBase:
 
     def generate_answer(self, question: str, passages: List[RetrievedPassage]) -> str:
         """Generate an answer from already-retrieved evidence."""
+        question = question.strip()
+        if not question:
+            raise ValueError("question cannot be empty")
         if not passages or max(p.score for p in passages) < self.min_score:
             return DECLINE_ANSWER
 
@@ -290,20 +284,30 @@ Answer:"""
 
     def query(self, question: str) -> Dict[str, Any]:
         """Retrieve evidence first, then generate a grounded answer."""
+        question = question.strip()
+        if not question:
+            raise ValueError("question cannot be empty")
         try:
             passages = self.retrieve(question)
             top_score = max((p.score for p in passages), default=0.0)
             enough_evidence = bool(passages) and top_score >= self.min_score
             answer = self.generate_answer(question, passages)
+            grounded = enough_evidence and answer != DECLINE_ANSWER
+            # This is an evidence-strength proxy based on vector similarity, not a
+            # calibrated probability that the generated statement is correct.
+            confidence = max(0.0, min(1.0, top_score)) if grounded else 0.0
             return {
                 "answer": answer,
                 "source": "fia_rag_agent",
-                "grounded": enough_evidence and answer != DECLINE_ANSWER,
+                "grounded": grounded,
+                "confidence": round(confidence, 4),
                 "top_retrieval_score": round(top_score, 4),
                 "retrieved_passages": [p.to_dict() for p in passages],
                 "referenced_rules": self._extract_rules(answer),
                 "citations": sorted(set(re.findall(r"\[S\d+\]", answer))),
             }
+        except ValueError:
+            raise
         except Exception as exc:
             self.last_error = str(exc)
             logger.exception("FIA RAG query failed")
@@ -311,6 +315,7 @@ Answer:"""
                 "answer": f"FIA RAG is unavailable: {exc}",
                 "source": "fia_rag_agent",
                 "grounded": False,
+                "confidence": 0.0,
                 "top_retrieval_score": 0.0,
                 "retrieved_passages": [],
                 "referenced_rules": [],
@@ -319,8 +324,10 @@ Answer:"""
 
     def status(self) -> Dict[str, Any]:
         pdf_count = len(glob.glob(str(self.fia_docs_path / "*.pdf")))
+        configured = RAG_DEPENDENCIES_AVAILABLE and bool(self.openai_api_key) and pdf_count > 0
         return {
             "ready": self.is_initialized,
+            "configured": configured,
             "dependencies_available": RAG_DEPENDENCIES_AVAILABLE,
             "api_key_configured": bool(self.openai_api_key),
             "docs_path": str(self.fia_docs_path),
@@ -334,7 +341,6 @@ Answer:"""
 
     @staticmethod
     def _extract_rules(answer: str) -> List[str]:
-        # Covers forms such as Article 38, Article 38.3, and Regulation 12.4.1.
         matches = re.findall(
             r"\b(?:Article|Regulation|Section)\s+\d+(?:\.\d+)*",
             answer,
