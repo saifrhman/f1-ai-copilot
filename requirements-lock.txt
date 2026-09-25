@@ -1,0 +1,384 @@
+# Fully resolved, cross-platform dependency set for requirements.txt (Python >= 3.11).
+# Regenerate with: uv pip compile --universal -p 3.11 requirements.txt -o requirements-lock.txt
+# Install with:    pip install -r requirements-lock.txt
+alembic==1.20.0
+    # via optuna
+altair==6.3.0
+    # via streamlit
+annotated-doc==0.0.5
+    # via fastapi
+annotated-types==0.8.0
+    # via pydantic
+anyio==4.15.1
+    # via
+    #   httpx
+    #   httpx2
+    #   langsmith
+    #   openai
+    #   starlette
+    #   streamlit
+    #   watchfiles
+attrs==26.1.0
+    # via
+    #   jsonschema
+    #   referencing
+audioop-lts==0.2.2 ; python_full_version >= '3.13'
+    # via
+    #   standard-aifc
+    #   standard-sunau
+audioread==3.1.0
+    # via librosa
+certifi==2026.7.22
+    # via
+    #   httpcore
+    #   httpx
+    #   langchain-openai
+    #   requests
+cffi==2.1.1
+    # via soundfile
+charset-normalizer==3.5.1
+    # via requests
+click==8.5.0
+    # via
+    #   streamlit
+    #   uvicorn
+cloudpickle==3.1.2
+    # via joblib
+colorama==0.4.6 ; sys_platform == 'win32'
+    # via
+    #   colorlog
+    #   pytest
+    #   tqdm
+colorlog==6.12.0
+    # via optuna
+contourpy==1.3.3
+    # via matplotlib
+cycler==0.12.1
+    # via matplotlib
+decorator==5.3.1
+    # via librosa
+distro==1.9.0
+    # via langsmith
+fastapi==0.141.1
+    # via -r requirements.txt
+fonttools==4.66.0
+    # via matplotlib
+grpcio==1.84.0
+    # via qdrant-client
+h11==0.16.0
+    # via
+    #   httpcore
+    #   httpcore2
+    #   uvicorn
+h2==4.4.1
+    # via httpx
+hpack==4.2.0
+    # via h2
+httpcore==1.0.9
+    # via httpx
+httpcore2==2.13.1 ; sys_platform != 'emscripten'
+    # via httpx2
+httptools==0.8.0
+    # via
+    #   streamlit
+    #   uvicorn
+httpx==0.28.1
+    # via
+    #   -r requirements.txt
+    #   langchain-core
+    #   qdrant-client
+httpx2==2.13.1
+    # via
+    #   langsmith
+    #   openai
+httpx2-jsfetch==1.0 ; python_full_version >= '3.12' and sys_platform == 'emscripten'
+    # via httpx2
+hyperframe==6.1.0
+    # via h2
+idna==3.20
+    # via
+    #   anyio
+    #   httpx
+    #   httpx2
+    #   requests
+iniconfig==2.3.0
+    # via pytest
+itsdangerous==2.2.0
+    # via streamlit
+jinja2==3.1.6
+    # via
+    #   altair
+    #   pydeck
+jiter==0.17.0
+    # via openai
+joblib==1.6.0
+    # via
+    #   librosa
+    #   scikit-learn
+jsonpatch==1.33
+    # via langchain-core
+jsonpointer==3.1.1
+    # via jsonpatch
+jsonschema==4.26.0
+    # via altair
+jsonschema-specifications==2025.9.1
+    # via jsonschema
+kiwisolver==1.5.1
+    # via matplotlib
+langchain-core==1.6.5
+    # via
+    #   -r requirements.txt
+    #   langchain-openai
+    #   langchain-text-splitters
+langchain-openai==1.6.6
+    # via -r requirements.txt
+langchain-protocol==0.0.19
+    # via langchain-core
+langchain-text-splitters==1.1.2
+    # via -r requirements.txt
+langsmith==0.14.0
+    # via langchain-core
+lazy-loader==0.6
+    # via librosa
+librosa==0.11.0
+    # via -r requirements.txt
+llvmlite==0.49.0
+    # via numba
+mako==1.4.3
+    # via alembic
+markupsafe==3.0.3
+    # via
+    #   jinja2
+    #   mako
+matplotlib==3.11.2
+    # via -r requirements.txt
+msgpack==1.2.2
+    # via librosa
+narwhals==2.26.0
+    # via
+    #   altair
+    #   scikit-learn
+numba==0.67.0
+    # via librosa
+numpy==2.4.6
+    # via
+    #   -r requirements.txt
+    #   contourpy
+    #   librosa
+    #   matplotlib
+    #   numba
+    #   optuna
+    #   pandas
+    #   pydeck
+    #   qdrant-client
+    #   scikit-learn
+    #   scipy
+    #   soundfile
+    #   soxr
+    #   streamlit
+openai==3.19.2
+    # via
+    #   -r requirements.txt
+    #   langchain-openai
+optuna==5.0.0
+    # via -r requirements.txt
+orjson==3.12.0 ; platform_python_implementation != 'PyPy'
+    # via langsmith
+packaging==26.3
+    # via
+    #   altair
+    #   langchain-core
+    #   langsmith
+    #   lazy-loader
+    #   matplotlib
+    #   optuna
+    #   pooch
+    #   pytest
+    #   streamlit
+pandas==3.0.6
+    # via streamlit
+pillow==12.3.0
+    # via
+    #   matplotlib
+    #   streamlit
+platformdirs==4.11.12
+    # via pooch
+pluggy==1.6.0
+    # via pytest
+pooch==1.9.0
+    # via librosa
+portalocker==3.2.0
+    # via qdrant-client
+protobuf==7.36.2
+    # via
+    #   qdrant-client
+    #   streamlit
+pyarrow==25.0.1
+    # via streamlit
+pycparser==3.0 ; implementation_name != 'PyPy'
+    # via cffi
+pydantic==2.13.5
+    # via
+    #   -r requirements.txt
+    #   fastapi
+    #   langchain-core
+    #   langsmith
+    #   openai
+    #   qdrant-client
+pydantic-core==2.46.5
+    # via pydantic
+pydeck==0.9.3
+    # via streamlit
+pygments==2.21.0
+    # via pytest
+pyparsing==3.3.3
+    # via matplotlib
+pypdf==6.19.0
+    # via -r requirements.txt
+pytest==9.1.1
+    # via -r requirements.txt
+python-dateutil==2.9.0.post0
+    # via
+    #   matplotlib
+    #   pandas
+python-dotenv==1.2.3
+    # via
+    #   -r requirements.txt
+    #   uvicorn
+python-multipart==0.0.32
+    # via streamlit
+pywin32==312 ; sys_platform == 'win32'
+    # via portalocker
+pyyaml==6.0.3
+    # via
+    #   langchain-core
+    #   optuna
+    #   uvicorn
+qdrant-client==1.19.1
+    # via -r requirements.txt
+referencing==0.37.0
+    # via
+    #   jsonschema
+    #   jsonschema-specifications
+regex==2026.9.10
+    # via tiktoken
+requests==2.34.2
+    # via
+    #   -r requirements.txt
+    #   langsmith
+    #   pooch
+    #   requests-toolbelt
+    #   streamlit
+    #   tiktoken
+requests-toolbelt==1.0.0
+    # via langsmith
+rpds-py==2026.6.3
+    # via
+    #   jsonschema
+    #   referencing
+scikit-learn==1.9.1
+    # via librosa
+scipy==1.17.1
+    # via
+    #   librosa
+    #   scikit-learn
+six==1.17.0
+    # via python-dateutil
+sniffio==1.3.1
+    # via
+    #   langsmith
+    #   openai
+soundfile==0.14.0
+    # via
+    #   -r requirements.txt
+    #   librosa
+soxr==1.1.0
+    # via librosa
+sqlalchemy==2.1.0
+    # via
+    #   alembic
+    #   optuna
+standard-aifc==3.13.0 ; python_full_version >= '3.13'
+    # via
+    #   audioread
+    #   librosa
+standard-chunk==3.13.0 ; python_full_version >= '3.13'
+    # via standard-aifc
+standard-sunau==3.13.0 ; python_full_version >= '3.13'
+    # via
+    #   audioread
+    #   librosa
+starlette==1.7.0
+    # via
+    #   fastapi
+    #   streamlit
+streamlit==1.64.0
+    # via -r requirements.txt
+tenacity==9.1.4
+    # via langchain-core
+threadpoolctl==3.7.0
+    # via scikit-learn
+tiktoken==0.14.0
+    # via langchain-openai
+toml==0.10.2
+    # via streamlit
+tqdm==4.70.1
+    # via optuna
+truststore==0.10.4 ; sys_platform != 'emscripten'
+    # via
+    #   httpcore2
+    #   httpx2
+typing-extensions==4.16.0
+    # via
+    #   alembic
+    #   altair
+    #   anyio
+    #   fastapi
+    #   grpcio
+    #   httpx2
+    #   langchain-core
+    #   langchain-protocol
+    #   langsmith
+    #   librosa
+    #   openai
+    #   pydantic
+    #   pydantic-core
+    #   referencing
+    #   soundfile
+    #   sqlalchemy
+    #   starlette
+    #   streamlit
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   fastapi
+    #   pydantic
+tzdata==2026.4 ; sys_platform == 'emscripten' or sys_platform == 'win32'
+    # via pandas
+urllib3==2.8.0
+    # via
+    #   qdrant-client
+    #   requests
+uuid-utils==0.17.1
+    # via
+    #   langchain-core
+    #   langsmith
+uvicorn==0.53.0
+    # via
+    #   -r requirements.txt
+    #   streamlit
+uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
+    # via uvicorn
+watchdog==6.0.0 ; sys_platform != 'darwin'
+    # via streamlit
+watchfiles==1.3.0
+    # via uvicorn
+websockets==16.1.1
+    # via
+    #   langsmith
+    #   streamlit
+    #   uvicorn
+xxhash==4.0.1
+    # via langsmith
+zstandard==0.25.0
+    # via langsmith

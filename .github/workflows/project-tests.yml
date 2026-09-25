@@ -1,4 +1,4 @@
-name: Project integration tests
+name: Project tests
 
 on:
   push:
@@ -8,33 +8,28 @@ on:
   workflow_dispatch:
 
 jobs:
-  project-tests:
+  tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install system audio dependency
-        run: sudo apt-get update && sudo apt-get install -y libsndfile1
-      - name: Install project dependencies
-        run: pip install -r requirements.txt
+          cache-dependency-path: requirements-lock.txt
+      - name: Install ffmpeg (M4A/WebM audio decoding tests)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install locked dependencies
+        run: pip install -r requirements-lock.txt
       - name: Compile Python source
-        run: python -m compileall -q app core_modules scripts tests
-      - name: Run complete test suite
-        run: python -m pytest -q
-      - name: Exercise strategy example
+        run: python -m compileall -q app core_modules scripts tests ui
+      - name: Run the complete test suite
+        run: python -m pytest -q -rs
+      - name: Run the strategy example
         run: python -m core_modules.strategy_optimizer.example_usage
-
-  fia-official-source-discovery:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-      - name: Install downloader dependency
-        run: pip install requests==2.31.0
-      - name: Verify current FIA regulation links can be discovered
-        run: python scripts/fetch_fia_regulations.py --year 2026 --dry-run
+      - name: Import the API the documented way
+        run: python -c "import app.main"

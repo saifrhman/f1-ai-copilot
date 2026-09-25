@@ -1,4 +1,22 @@
-# Optional local speech-to-text support for driver-radio transcription.
-# Requires ffmpeg to be installed on the host.
+# Optional local speech-to-text for driver-radio transcription (large: pulls in PyTorch).
+# Requires ffmpeg on the host (e.g. `sudo apt-get install ffmpeg`).
+#
+# CPU-only install (recommended without an NVIDIA GPU): install the CPU build of PyTorch first,
+# so pip does not download the multi-GB CUDA wheels; openai-whisper then keeps that torch:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-whisper.txt
+# On Linux x86_64 openai-whisper also installs triton (~0.9 GB), which it only uses for CUDA
+# kernels; a CPU-only install can remove it: pip uninstall -y triton
+# (Verified with torch 2.14.0+cpu on Python 3.12: about 0.7 GB for torch.)
+#
+# Configuration (environment or .env):
+# - WHISPER_MODEL: default "base"; an official name listed by whisper.available_models(), e.g.
+#   tiny, base, small, turbo. Paths to local checkpoint files are not supported.
+# - WHISPER_CACHE_DIR: where the model is downloaded on first use and loaded from later
+#   (default $XDG_CACHE_HOME/whisper, usually ~/.cache/whisper). It must be a writable directory
+#   or creatable in a writable parent; a read-only directory works if it already holds the model.
+# Check a setup (exit status 0 ok, 1 audio rejected or load/transcription failed, 2 usage error,
+# 3 Whisper/ffmpeg unavailable or invalid WHISPER_MODEL/WHISPER_CACHE_DIR):
+#   WHISPER_MODEL=tiny python scripts/check_whisper.py path/to/radio.wav
 -r requirements.txt
 openai-whisper==20250625

@@ -1,0 +1,17 @@
+[project]
+name = "f1-ai-copilot"
+version = "1.2.0"
+description = "Formula 1 analysis API with an evidence-grounded FIA regulation RAG system"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    "error::DeprecationWarning:core_modules.*",
+    "error::DeprecationWarning:app.*",
+    # audioread (used by librosa only for ffmpeg-decoded containers such as M4A) imports stdlib
+    # modules that Python 3.13 removed; on 3.13 the standard-* backports in the lock file are used.
+    "ignore:'(aifc|audioop|sunau)' is deprecated:DeprecationWarning:audioread.*",
+]

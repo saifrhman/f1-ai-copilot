@@ -4,6 +4,7 @@ venv/
 .env
 .env.*
 !.env.example
+**/.streamlit/secrets.toml
 
 # Python cache and compiled files
 __pycache__/
@@ -34,3 +35,6 @@ outputs/
 .DS_Store
 .vscode/
 .idea/
+
+# Embedding cache (provider vectors keyed by model + text hash)
+.cache/

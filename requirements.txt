@@ -1,34 +1,35 @@
-# API
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-pydantic==2.5.0
-httpx==0.25.2
+# Direct dependencies, pinned to versions verified together on Python 3.11, 3.12 and 3.13.
+# (requirements-lock.txt pins the complete resolved set for fully reproducible installs.)
 
-# Numeric optimisation and visualization
-numpy==1.24.3
-optuna==3.5.0
-matplotlib==3.8.2
-pillow==10.1.0
+# API
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+httpx==0.28.1
+
+# Numeric optimisation and visualisation
+numpy==2.4.6
+optuna==5.0.0
+matplotlib==3.11.2
 
 # Audio analysis
-librosa==0.10.1
-soundfile==0.12.1
+librosa==0.11.0
+soundfile==0.14.0
 
-# FIA regulation RAG
-langchain==0.0.350
-langchain-community==0.0.20
-langchain-core==0.1.23
-langchain-openai==0.0.2
-langsmith==0.0.87
-openai==1.6.1
-qdrant-client==1.7.0
-pypdf==3.17.4
-packaging==23.2
+# FIA regulation RAG (LangChain + Qdrant)
+langchain-core==1.6.5
+langchain-text-splitters==1.1.2
+langchain-openai==1.6.6
+openai==3.19.2
+qdrant-client==1.19.1
+pypdf==6.19.0
+
+# Web UI (Streamlit client of the API; see requirements-ui.txt for a UI-only install)
+streamlit==1.64.0
 
 # Utilities
-requests==2.31.0
-python-dotenv==1.0.0
+requests==2.34.2
+python-dotenv==1.2.3
 
 # Tests
-pytest==7.4.3
-pytest-cov==4.1.0
+pytest==9.1.1
