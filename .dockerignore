@@ -1,0 +1,30 @@
+# Secrets never enter the build context (pass settings at runtime, e.g. docker compose env_file).
+# Patterns match from the context root, so "**/" is needed to cover every folder.
+**/.env
+**/.env.*
+!.env.example
+**/.envrc
+**/*.key
+**/*.pem
+**/.streamlit/secrets.toml
+
+# Local data, indexes, caches and generated output (bind-mount them instead)
+data/
+outputs/
+.qdrant/
+.cache/
+
+# Version control, virtual environments and tool caches
+.git/
+.github/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store

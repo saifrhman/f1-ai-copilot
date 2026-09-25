@@ -1,0 +1,105 @@
+# F1 AI Copilot in Docker: the API, the web UI and a Qdrant server for the FIA regulation index.
+#
+#   mkdir -p data/fia_docs .cache outputs     # bind-mounted below; create them before the first run
+#   docker compose up -d --build              # UI http://127.0.0.1:8501, API http://127.0.0.1:8000/docs
+#   docker compose run --rm api python scripts/fetch_fia_regulations.py
+#   docker compose run --rm api python scripts/build_fia_index.py --dry-run   # then without --dry-run
+#   docker compose up -d api                  # apply .env changes (`restart` keeps the old settings)
+#   docker compose down                       # stop (add -v to delete the stored index)
+#
+# The api and ui services run the image built from the Dockerfile. Settings and the API key come
+# from .env at runtime and are never part of the image. On Linux, bind-mounted folders must be
+# writable by the container user: build with APP_UID=$(id -u) when your user id is not 1000.
+# Every port is published on 127.0.0.1 only: the API and the UI have no authentication.
+#
+# Only the Qdrant server (host-run API and index builds):
+#
+# Embedded Qdrant storage (QDRANT_PATH, the default) can be opened by only one
+# process, so the API and scripts/build_fia_index.py cannot run at the same time
+# and `uvicorn --workers N` (N > 1) cannot share it. Run this server instead and
+# point every process at it:
+#
+#   docker compose up -d --wait qdrant   # start and wait until /readyz answers
+#   export QDRANT_URL=http://127.0.0.1:6333
+#   python scripts/build_fia_index.py
+#   uvicorn app.main:app --workers 2
+#   docker compose down                  # stop (add -v to delete the stored index)
+#
+# The server removes the single-process lock. Rebuilds switch the index over
+# atomically (a new collection behind an alias), so a running API keeps answering
+# from the complete old index until the switch: see docs/fia-rag.md.
+#
+# API key (optional): set QDRANT_API_KEY in the shell or in .env. Compose reads
+# .env in this directory for ${...} substitution and the app reads the same
+# variable. Use a key without '$' (for example `openssl rand -hex 32`) or
+# single-quote it in .env: Compose expands '$name' inside unquoted and
+# double-quoted .env values (QDRANT_API_KEY=abc$def reaches the server as
+# "abc") but python-dotenv, which the app uses, does not, so every request
+# would fail with 401 Unauthorized. Left empty, the server accepts
+# unauthenticated requests; it is only published on 127.0.0.1.
+
+services:
+  api:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+    image: f1-ai-copilot:local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      QDRANT_URL: http://qdrant:6333  # overrides QDRANT_URL/QDRANT_PATH from .env: the index lives in the qdrant service
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data        # FIA regulation PDFs (data/fia_docs)
+      - ./.cache:/app/.cache    # embedding cache: unchanged rebuilds make no provider requests
+      - ./outputs:/app/outputs  # ghost-car images
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  ui:
+    image: f1-ai-copilot:local
+    pull_policy: never  # built by the api service
+    command: ["streamlit", "run", "ui/streamlit_app.py", "--server.address", "0.0.0.0", "--server.port", "8501", "--server.headless", "true"]
+    environment:
+      F1_API_URL: http://api:8000
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  qdrant:
+    # Keep the server release in step with qdrant-client (1.19.x in requirements.txt).
+    image: qdrant/qdrant:v1.19.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"  # REST API (the only protocol the app uses)
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT__TELEMETRY_DISABLED: "true"  # no anonymous usage reports to Qdrant
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      # The image has bash but no curl/wget; /readyz needs no API key.
+      test:
+        - CMD
+        - bash
+        - -c
+        - exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.0\r\n\r\n' >&3 && head -n 1 <&3 | grep -q ' 200 '
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  qdrant_storage:

@@ -1,0 +1,23 @@
+# Streamlit settings for the F1 AI Copilot web UI. They live next to ui/streamlit_app.py, so
+# Streamlit applies them from any working directory (a .streamlit/ folder in the current
+# directory would only apply when started from there). Command-line flags override them,
+# e.g. --server.port 8600.
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# This computer only; use --server.address 0.0.0.0 to serve other devices (the API has no authentication).
+address = "127.0.0.1"
+port = 8501
+# Largest upload in MiB. Radio clips may be at most 20 MiB decoded (the API's audio limit), which
+# is about 27 MiB as base64 JSON, inside the API's 40 MB body limit for audio routes.
+maxUploadSize = 20
+runOnSave = false
+
+[client]
+# Hide developer options (e.g. "Clear cache") from the app menu.
+toolbarMode = "viewer"
+
+[theme]
+primaryColor = "#E10600"
