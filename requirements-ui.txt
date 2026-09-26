@@ -3,5 +3,8 @@
 #   pip install -r requirements-ui.txt
 #   streamlit run ui/streamlit_app.py
 streamlit==1.64.0
+pandas==3.0.6
+altair==6.3.0
+numpy==2.4.6
 httpx==0.28.1
 python-dotenv==1.2.3

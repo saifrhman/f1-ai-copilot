@@ -9,27 +9,36 @@ from __future__ import annotations
 import base64
 import json
 import math
-import re
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
-from ui.api_client import ApiError, ApiUnavailable, get_client
+from ui.api_client import ApiError, ApiUnavailable, RequestNotSent, encode_json, get_client
 from ui.components import (
-    ACOUSTIC_CONFIDENCE_RULE,
-    AUDIO_TYPES,
-    MAX_AUDIO_BYTES,
+    CLIP_SOURCES,
+    DEFINITIONS_ONLY_NOTE,
+    MAX_AUDIO_TEXT,
+    UPLOAD,
     api_schema,
     cached_health,
+    cites_regulation_passage,
+    clip_input,
+    decline_explanation,
     documented_example,
+    evidence_label,
     heuristic_badge,
     humanise,
     json_expander,
     md_text,
+    not_modelled_text,
+    oversize_problem,
     page_links,
     profile_tie_note,
+    render_passage,
     show_api_error,
+    show_input_problems,
     state_badge,
+    transcription_state,
 )
 
 QUERY_KEY = "assistant_query"
@@ -38,9 +47,7 @@ NOTICE_KEY = "assistant_notice"
 RESULT_KEY = "assistant_result"
 EXAMPLE_KEY = "assistant_example"
 EXAMPLE_VALUES_KEY = "assistant_example_values"  # context key -> value last inserted by a helper
-UPLOAD, RECORD = "Upload a file", "Record"
 MAX_QUERY_CHARS = 2000  # the API's limit (MAX_QUERY_CHARS in core_modules/llm_query)
-SAFE_URL = re.compile(r"https://[^\s()<>\[\]]+")
 
 EXAMPLE_QUESTIONS = (
     "What is the pit lane speed limit rule?",
@@ -92,7 +99,8 @@ ROUTES = {
 CONFIDENCE_MEANING = {
     "regulatory": (
         "Evidence strength",
-        "Similarity of the best cited passage (0-1); 0 when declined. Not a probability.",
+        "Similarity of the best cited regulation passage (0-1); 0 when declined, – when only definitions were cited. "
+        "Not a probability.",
     ),
     "strategy": ("Score", "The strategy engine reports time margins between plans, not a confidence."),
     "technical": (
@@ -105,8 +113,8 @@ CONFIDENCE_MEANING = {
     ),
     "emotion": (
         "Heuristic score",
-        f"0-0.95, not a probability: the acoustic confidence ({ACOUSTIC_CONFIDENCE_RULE}), combined with the "
-        "transcript keyword score when a transcript is used.",
+        "Not a probability: the acoustic confidence, combined with the transcript keyword score when a transcript "
+        "is used. The rules are under the answer.",
     ),
 }
 # data_sources ids of the API -> what the answer used
@@ -135,38 +143,6 @@ DECISION_RULES = {
     "tie_context_supplied": "A tie went to the only tied module whose required context was supplied.",
     "tie_priority_order": "A tie was broken by the fixed order regulatory > strategy > technical > emotion > performance.",
 }
-REPHRASE = "Rephrasing the question can help."
-# decline_reason -> (what happened, what the user can do)
-DECLINE_REASONS = {
-    "no_evidence_above_threshold": (
-        "no indexed passage was similar enough to the question, so no answer was generated",
-        "Use the regulations' own terms, or search the passages on the FIA regulations page to see the closest "
-        "ones and their scores.",
-    ),
-    "model_declined": (
-        "the answer model found the retrieved passages insufficient",
-        "If the evidence below does not cover the question, the regulations probably do not either; rephrasing "
-        "can bring in other passages.",
-    ),
-    "empty_model_output": (
-        "the answer model returned no text",
-        "Ask again; if it repeats, check the answer model and provider settings of the API.",
-    ),
-    "missing_citation": ("the generated answer cited no passage", REPHRASE),
-    "invalid_citation": ("the generated answer cited a passage that was not supplied", REPHRASE),
-    "unsupported_rule_reference": (
-        "the generated answer named a rule number that its cited passages do not contain",
-        REPHRASE,
-    ),
-    "unsupported_number": ("the generated answer stated a number that its cited passages do not contain", REPHRASE),
-    "uncited_claim": ("part of the generated answer made a statement without a citation", REPHRASE),
-    "truncated_model_output": (
-        "the model's answer stopped before it finished (its output limit, or the provider's content filter)",
-        "Ask a narrower question. If it keeps happening, the FIA regulations page shows which limit stopped it; for "
-        "the output limit, raise `FIA_RAG_MAX_OUTPUT_TOKENS` for the API.",
-    ),
-    "unverified_claim": ("the claim check could not confirm a sentence against its cited passages", REPHRASE),
-}
 
 
 # ------------------------------------------------------------------ context
@@ -193,11 +169,11 @@ def parse_context(text: str) -> Optional[Dict[str, Any]]:
         return None
     try:
         value = json.loads(text, parse_constant=_reject_constant, parse_float=_finite_number)
-        json.dumps(value, ensure_ascii=False).encode("utf-8")  # as the request body is encoded
+        encode_json(value)  # as the request body is encoded
     except json.JSONDecodeError as exc:
         raise ValueError(f"not valid JSON: {exc.msg} (line {exc.lineno}, column {exc.colno})") from None
-    except UnicodeEncodeError:
-        raise ValueError("it contains a \\u escape of a lone surrogate (such as \\ud800), which is not valid text") from None
+    except RequestNotSent as exc:
+        raise ValueError(exc.reason) from None
     except RecursionError:
         raise ValueError("it is nested too deeply") from None
     if not isinstance(value, dict):
@@ -252,10 +228,9 @@ def build_context(clip: Any, transcribe: bool) -> Optional[Dict[str, Any]]:
     if clip is None:
         return context
     audio = clip.getvalue()
-    if len(audio) > MAX_AUDIO_BYTES:
-        raise ValueError(
-            f"The attached clip is {len(audio) / 2**20:.1f} MiB; the API accepts at most {MAX_AUDIO_BYTES // 2**20} MiB."
-        )
+    too_large = oversize_problem(audio)
+    if too_large:
+        raise ValueError(too_large)
     if context and "audio_file" in context:
         raise ValueError("Context: remove `audio_file` from the JSON, or detach the clip.")
     context = {**(context or {}), "audio_file": base64.b64encode(audio).decode("ascii")}
@@ -282,25 +257,6 @@ def describe_context(context: Optional[Dict[str, Any]]) -> str:
 # ------------------------------------------------------------------ result
 
 
-def passage_title(passage: Dict[str, Any]) -> str:
-    page = passage.get("page_label") or passage.get("page")
-    parts = [f"{passage.get('label')}", str(passage.get("source")), f"p. {page}" if page is not None else ""]
-    if passage.get("kind") == "definition":
-        parts.append(f"definition of {passage.get('defined_term')}")
-    else:
-        if passage.get("nearest_rule"):
-            parts.append(str(passage["nearest_rule"]))
-        parts.append(f"similarity {float(passage.get('score', 0.0)):.3f}")
-    return md_text(" · ".join(part for part in parts if part))
-
-
-def render_passage_text(passage: Dict[str, Any]) -> None:
-    st.markdown(md_text(passage.get("text", "")).replace("\n", "  \n"))
-    url = passage.get("source_url")
-    if url and SAFE_URL.fullmatch(str(url)):
-        st.caption(f"[Official PDF]({url})")
-
-
 def render_regulatory(extra: Dict[str, Any], confidence: Optional[float]) -> None:
     """A grounded answer with its cited passages, or a decline; a rejected answer's citations are never shown as evidence."""
 
@@ -312,26 +268,28 @@ def render_regulatory(extra: Dict[str, Any], confidence: Optional[float]) -> Non
             "against them.",
             icon=":material/verified:",
         )
-        st.caption(
-            f"Evidence strength {confidence or 0.0:.3f} (similarity of the best cited passage; not a probability); "
-            f"best retrieval similarity {best_retrieved:.3f}."
-        )
+        if cites_regulation_passage(passages):
+            st.caption(
+                f"Evidence strength {confidence or 0.0:.3f} (similarity of the best cited regulation passage; not a "
+                f"probability); best retrieval similarity {best_retrieved:.3f}."
+            )
+        else:
+            st.caption(f"{DEFINITIONS_ONLY_NOTE} Best retrieval similarity {best_retrieved:.3f}.")
         if extra.get("referenced_rules"):
             st.caption(f"Rules referenced, each found in the cited passages: {md_text(', '.join(extra['referenced_rules']))}")
         for passage in (p for p in passages if p.get("cited")):
-            with st.expander(passage_title(passage), expanded=True, icon=":material/format_quote:"):
-                render_passage_text(passage)
+            with st.expander(evidence_label(passage, grounded=True), expanded=True, icon=":material/format_quote:"):
+                render_passage(passage)
         others = [p for p in passages if not p.get("cited")]
         if others:
             with st.expander(f"Other evidence given to the model, not cited ({len(others)})", icon=":material/description:"):
                 for passage in others:
-                    st.markdown(f"**{passage_title(passage)}**")
-                    render_passage_text(passage)
+                    render_passage(passage)
     else:
         reason = extra.get("decline_reason")
-        happened, next_step = DECLINE_REASONS.get(reason, ("see the raw response", ""))
+        headline, happened, next_step = decline_explanation(reason)
         st.warning(
-            f"Declined ({md_text(reason or 'no reason given')}): {happened}. No unverified answer is shown.",
+            f"Declined ({md_text(reason or 'no reason given')}): {headline}. {happened} No unverified answer is shown.",
             icon=":material/block:",
         )
         if next_step:
@@ -343,11 +301,9 @@ def render_regulatory(extra: Dict[str, Any], confidence: Optional[float]) -> Non
         if passages:
             with st.expander(f"Evidence given to the model ({len(passages)})", icon=":material/description:"):
                 if any(p.get("cited") for p in passages):
-                    st.caption("Passages marked as cited were cited by the rejected answer: they are not verified evidence.")
+                    st.caption("Passages marked as cited were cited by the rejected output: they are not verified evidence.")
                 for passage in passages:
-                    note = " · cited by the rejected answer" if passage.get("cited") else ""
-                    st.markdown(f"**{passage_title(passage)}{note}**")
-                    render_passage_text(passage)
+                    render_passage(passage, grounded=False)
     if not passages:
         st.caption("No passage passed the similarity threshold.")
     st.caption("The FIA regulations page shows retrieval settings and passages below the threshold.")
@@ -371,7 +327,7 @@ def render_strategy(extra: Dict[str, Any]) -> None:
         column_config={name: st.column_config.NumberColumn(format="%.3f") for name in ("Projected time (s)", "Behind best (s)")},
     )
     if extra.get("not_modelled_inputs"):
-        st.caption(f"Accepted but not modelled: {md_text(', '.join(extra['not_modelled_inputs']))}")
+        st.caption(not_modelled_text(extra["not_modelled_inputs"]))
 
 
 def render_setup(extra: Dict[str, Any]) -> None:
@@ -415,8 +371,11 @@ def render_emotion(extra: Dict[str, Any]) -> None:
     st.caption(
         f"Acoustic label {md_text(extra.get('acoustic_emotion'))} ({extra.get('acoustic_confidence')}); {md_text(note)}; "
         f"combination rule: {md_text(humanise(extra.get('evidence_combination')))}. The Driver radio page shows the "
-        "features, the profile scores and what each combination rule does."
+        "features and the profile scores."
     )
+    for label, key in (("Acoustic confidence", "acoustic_confidence_rule"), ("Combination rule", "evidence_combination_rule")):
+        if extra.get(key):
+            st.caption(f"**{label}:** {md_text(extra[key])}")
     tie = profile_tie_note(extra.get("acoustic_profile_scores") or {}, extra.get("acoustic_emotion"))
     if tie:
         st.warning(tie, icon=":material/balance:")
@@ -460,11 +419,15 @@ def render_result(result: Dict[str, Any]) -> None:
     columns = st.columns(3)
     columns[0].metric("Routed to", route_label(kind), help=f"Answered by {module} (query_type {kind})")
     score_name, meaning = CONFIDENCE_MEANING.get(kind, ("Score", NOT_RUN_MEANING))
-    columns[1].metric(
-        score_name,
-        "no score" if confidence is None else f"{confidence:.3f}" if ran else "not run",
-        help=meaning if ran else NOT_RUN_MEANING,
-    )
+    if confidence is None:
+        score = "no score"
+    elif not ran:
+        score = "not run"
+    elif kind == "regulatory" and extra.get("grounded") and not cites_regulation_passage(extra.get("retrieved_passages") or []):
+        score = "–"  # only definitions were cited, and they have no similarity
+    else:
+        score = f"{confidence:.3f}"
+    columns[1].metric(score_name, score, help=meaning if ran else NOT_RUN_MEANING)
     columns[2].metric(
         "Data sources",
         ", ".join(DATA_SOURCES.get(source, humanise(source)) for source in sources) or "none",
@@ -508,8 +471,7 @@ try:
     health = cached_health()
 except (ApiUnavailable, ApiError):
     health = {}  # the error is shown when a question is sent
-modules = health.get("modules") or {}
-rag_state, whisper_state = modules.get("fia_rag"), modules.get("emotion_transcription")
+rag_state = (health.get("modules") or {}).get("fia_rag")
 if rag_state not in (None, "ready"):
     st.markdown(
         f"{state_badge(rag_state)} Regulation QA is not ready on this API: regulatory questions get "
@@ -575,21 +537,19 @@ st.text_area(
     label_visibility="collapsed",
 )
 with st.expander("Attach a driver-radio clip (for radio questions)", icon=":material/graphic_eq:"):
-    clip_source = st.segmented_control("Clip", [UPLOAD, RECORD], default=UPLOAD, required=True, key="assistant_clip_source")
-    if clip_source == UPLOAD:
-        clip = st.file_uploader("Radio clip", type=AUDIO_TYPES, key="assistant_clip")
-    else:
-        clip = st.audio_input("Record a clip", key="assistant_recording")
-    whisper_missing = whisper_state not in (None, "ready")
+    clip_source = st.segmented_control("Clip", CLIP_SOURCES, default=UPLOAD, required=True, key="assistant_clip_source")
+    clip = clip_input(clip_source, "assistant")
+    transcription = transcription_state()
+    whisper_missing = transcription["available"] is False
     transcribe = st.toggle(
         "Transcribe with Whisper",
         disabled=whisper_missing,
         key="assistant_transcribe",
-        help=f"Unavailable on this API: {(health.get('details') or {}).get('emotion_transcription')}"
+        help=f"Unavailable on this API: {transcription['reason']}"
         if whisper_missing
         else "Adds a keyword heuristic on the transcript (slower).",
     )
-    st.caption("Sent as `audio_file` (base64) with the question; at most 20 MiB.")
+    st.caption(f"Sent as `audio_file` (base64) with the question; at most {MAX_AUDIO_TEXT}.")
 
 if st.button("Ask", type="primary", icon=":material/send:", key="assistant_ask"):
     st.session_state.pop(RESULT_KEY, None)
@@ -601,7 +561,7 @@ if st.button("Ask", type="primary", icon=":material/send:", key="assistant_ask")
     except ValueError as exc:
         problems.append(str(exc))
     if problems:
-        st.error("Nothing was sent to the API:\n" + "\n".join(f"- {problem}" for problem in problems), icon=":material/rule:")
+        show_input_problems(problems)
     else:
         try:
             with st.spinner("Routing the question..."):

@@ -22,18 +22,21 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
+from core_modules.rule_checker.fia_files import MANIFEST_NAME, fia_section
+
 from .config import ChunkingConfig, display_path
 from .errors import DocumentError, RAGConfigurationError
 from .rules import extract_headings, extract_rule_ids
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_NAME = "manifest.json"
 # Bumped whenever text extraction/normalisation/chunk metadata changes, so an
 # index built by an older ingestion version is detected as stale.
 INGESTION_VERSION = "4"
 _CHUNK_NAMESPACE = uuid.UUID("5b0f7a52-6a1e-4a4e-9a55-f1a0c0de2026")
 _SPLITTER_SEPARATORS = ["\n\n", "\n", ". ", "; ", " ", ""]
+# A page with fewer letters and digits than this (after the header is removed) counts as blank.
+_MIN_PAGE_CHARS = 20
 
 
 @dataclass(frozen=True)
@@ -77,10 +80,7 @@ class Chunk:
     chunk_id: str
     text: str  # verbatim extracted text, shown to the model and returned as evidence
     metadata: Dict[str, object]
-    embedding_text: str = ""  # text + short document/article context, used only for the vector
-
-    def text_for_embedding(self) -> str:
-        return self.embedding_text or self.text
+    embedding_text: str  # text + short document/article context, used only for the vector
 
 
 # --------------------------------------------------------------------------- discovery
@@ -114,18 +114,6 @@ def _load_manifest(docs_path: Path) -> Dict[str, dict]:
         return {str(entry["filename"]): entry for entry in entries if "filename" in entry}
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise DocumentError(f"{manifest_path} is not a valid FIA download manifest: {exc}") from exc
-
-
-_FIA_SECTION_FILE = re.compile(
-    r"fia[_ -]*(\d{4})[_ -]*(?:f1|formula[_ -]*1)[_ -]*regulations[_ -]*-?[_ -]*section[_ -]*([a-f])(?![a-z])"
-)
-
-
-def _fia_section(filename: str) -> Optional[Tuple[str, str]]:
-    """(year, section letter) of an official FIA regulation file name, if it is one."""
-
-    match = _FIA_SECTION_FILE.match(filename.lower())
-    return (match.group(1), match.group(2).upper()) if match else None
 
 
 def discover_documents(docs_path: Path) -> DiscoveryResult:
@@ -163,9 +151,9 @@ def discover_documents(docs_path: Path) -> DiscoveryResult:
             raise DocumentError(
                 f"{MANIFEST_NAME} lists files that are missing: {', '.join(missing)}. Re-run the downloader."
             )
-        listed_sections = {_fia_section(name): name for name in manifest if _fia_section(name)}
+        listed_sections = {fia_section(name): name for name in manifest if fia_section(name)}
         for path in pdf_paths:
-            section = _fia_section(path.name)
+            section = fia_section(path.name)
             if path.name not in manifest and section in listed_sections:
                 raise DocumentError(
                     f"{path.name} is another issue of FIA {section[0]} Section {section[1]} than the one in "
@@ -226,23 +214,23 @@ _HEADER_WINDOW = 450
 _HEADER_DECORATION = re.compile(r"^\s*0\s+(?:[A-F]\s+)?")
 
 
-def split_page_header(text: str) -> Tuple[Optional[str], str, str]:
-    """Return ``(page_label, header, body)``; text without the FIA page header is returned unchanged."""
+def split_page_header(text: str) -> Tuple[Optional[str], str]:
+    """Return ``(page_label, body)``; text without the FIA page header is returned unchanged."""
 
     match = _HEADER_START.match(text)
     if not match:
-        return None, "", text
+        return None, text
     window = text[:_HEADER_WINDOW]
     ends = [m.end() for m in _HEADER_END_MARKERS.finditer(window)]
     if not ends:
-        return None, "", text
+        return None, text
     cut = max(ends)
     header, body = text[:cut], text[cut:]
     body = _HEADER_DECORATION.sub("", body, count=1)
     letter = match.group(1).upper()
     label_match = re.search(rf"\b{letter}\s?(\d{{1,3}})\b", header[match.end():])
     page_label = f"{letter}{label_match.group(1)}" if label_match else None
-    return page_label, header, body
+    return page_label, body
 
 
 # The FIA PDFs encode some "ff"/"ffi" ligatures with glyphs that extract as a
@@ -299,7 +287,7 @@ def _quiet_pypdf():
         pypdf_logger.setLevel(previous)
 
 
-def load_pages(document: SourceDocument, min_page_chars: int = 20) -> Tuple[List[Document], DocumentReport]:
+def load_pages(document: SourceDocument) -> Tuple[List[Document], DocumentReport]:
     """Extract one LangChain ``Document`` per page that contains text.
 
     Unreadable PDFs and per-page extraction failures raise :class:`DocumentError`
@@ -309,10 +297,10 @@ def load_pages(document: SourceDocument, min_page_chars: int = 20) -> Tuple[List
     """
 
     with _quiet_pypdf():
-        return _load_pages(document, min_page_chars)
+        return _load_pages(document)
 
 
-def _load_pages(document: SourceDocument, min_page_chars: int) -> Tuple[List[Document], DocumentReport]:
+def _load_pages(document: SourceDocument) -> Tuple[List[Document], DocumentReport]:
     try:
         reader = PdfReader(str(document.path))
         if reader.is_encrypted and not reader.decrypt(""):
@@ -333,9 +321,9 @@ def _load_pages(document: SourceDocument, min_page_chars: int) -> Tuple[List[Doc
             raw = page.extract_text() or ""
         except Exception as exc:  # pypdf raises many exception types for damaged content streams
             raise DocumentError(f"{document.filename}: text extraction failed on page {number}: {exc}") from exc
-        page_label, _, body = split_page_header(raw)
+        page_label, body = split_page_header(raw)
         text = normalise_text(body)
-        if _alnum_count(text) < min_page_chars:
+        if _alnum_count(text) < _MIN_PAGE_CHARS:
             empty_pages.append(number)
             continue
         if looks_like_contents_page(text):
@@ -440,13 +428,6 @@ def chunk_pages(pages: Sequence[Document], config: ChunkingConfig) -> List[Chunk
         if headings:
             current_rule[source] = headings[-1][1]
     return chunks
-
-
-def load_and_chunk(
-    documents: Sequence[SourceDocument], config: ChunkingConfig
-) -> Tuple[List[Chunk], List[DocumentReport]]:
-    chunks, reports, _ = load_chunks_and_pages(documents, config)
-    return chunks, reports
 
 
 def load_chunks_and_pages(

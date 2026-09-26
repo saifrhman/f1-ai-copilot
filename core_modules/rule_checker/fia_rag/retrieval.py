@@ -110,21 +110,15 @@ class RetrievalResult:
         scores = [p.score for p in self.passages + self.below_threshold]
         return max(scores) if scores else 0.0
 
-    def to_dict(self, include_text: bool = True) -> Dict[str, Any]:
-        def render(passage: RetrievedPassage) -> Dict[str, Any]:
-            data = passage.to_dict()
-            if not include_text:
-                data.pop("text")
-            return data
-
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "question": self.question,
             "top_k": self.top_k,
             "min_score": self.min_score,
             "top_score": round(self.top_score, 4),
-            "passages": [render(p) for p in self.passages],
-            "below_threshold": [render(p) for p in self.below_threshold],
-            "definitions": [render(p) for p in self.definitions],
+            "passages": [p.to_dict() for p in self.passages],
+            "below_threshold": [p.to_dict() for p in self.below_threshold],
+            "definitions": [p.to_dict() for p in self.definitions],
             "duplicates_removed": self.duplicates_removed,
         }
 

@@ -16,7 +16,7 @@ distinct from article identifiers (``Appendix B2`` is not ``Article B2``).
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Set, Tuple
 
 # Components after a dot may have up to 4 digits so an over-long invented id ("B1.6.3.1000") is
 # captured whole (and then rejected) instead of being read as its supported parent.
@@ -81,11 +81,19 @@ def _appendix(raw: str) -> str:
     return normalise_rule_id("Appendix " + raw)
 
 
-def extract_rule_ids(text: str) -> List[str]:
-    """Rule identifiers mentioned in free text, in order of first appearance, without duplicates."""
+def _repair_split_ids(text: str) -> str:
+    """Join identifiers that PDF extraction split after a dot ("Article C5. 2.8" -> "Article C5.2.8")."""
 
-    text = _SPLIT_ID.sub(r"\1.", text)
-    spans: List[Tuple[int, str]] = []
+    return _SPLIT_ID.sub(r"\1.", text)
+
+
+def rule_id_spans(text: str) -> List[Tuple[int, int, str]]:
+    """(start, end, identifier) of every rule identifier in ``text``, in text order, as offsets into ``text``.
+
+    Identifiers that PDF extraction split after a dot are only recognised after ``_repair_split_ids``.
+    """
+
+    spans: List[Tuple[int, int, str]] = []
 
     def walk_list(end: int, first: str, appendix: bool) -> None:
         # After "Articles 5 and" a plain integer continues the list; after a dotted or
@@ -100,31 +108,29 @@ def extract_rule_ids(text: str) -> List[str]:
                 appendix = bool(re.fullmatch(_APPENDIX_KEYWORDS, keyword, re.IGNORECASE))
             elif value.isdigit() and not plain_list:
                 return
-            spans.append((more.start(2), _appendix(value) if appendix else normalise_rule_id(value)))
+            spans.append((more.start(2), more.end(2), _appendix(value) if appendix else normalise_rule_id(value)))
             end = more.end()
 
     for match in _ARTICLE_REF.finditer(text):
         group = 1 if match.group(1) else 2
-        spans.append((match.start(group), normalise_rule_id(match.group(group))))
+        spans.append((match.start(group), match.end(group), normalise_rule_id(match.group(group))))
         walk_list(match.end(), match.group(group), appendix=False)
     for match in _APPENDIX_REF.finditer(text):
-        spans.append((match.start(1), _appendix(match.group(1))))
+        spans.append((match.start(1), match.end(1), _appendix(match.group(1))))
         walk_list(match.end(), match.group(1), appendix=True)
-    claimed = {position for position, _ in spans}
-    for match in _BARE_REF.finditer(text):
-        if match.start(1) not in claimed:
-            spans.append((match.start(1), normalise_rule_id(match.group(1))))
-    for match in _NUMERIC_OF_REF.finditer(text):
-        if match.start(1) not in claimed:
-            spans.append((match.start(1), normalise_rule_id(match.group(1))))
+    claimed = {start for start, _, _ in spans}
+    for pattern in (_BARE_REF, _NUMERIC_OF_REF):
+        for match in pattern.finditer(text):
+            if match.start(1) not in claimed:
+                spans.append((match.start(1), match.end(1), normalise_rule_id(match.group(1))))
+    # A listed identifier that also has its own keyword ("Articles 12.2 and Article 12.4") is found twice.
+    return sorted(set(spans))
 
-    found: List[str] = []
-    seen: Set[str] = set()
-    for _, rule in sorted(spans, key=lambda item: item[0]):
-        if rule not in seen:
-            seen.add(rule)
-            found.append(rule)
-    return found
+
+def extract_rule_ids(text: str) -> List[str]:
+    """Rule identifiers mentioned in free text, in order of first appearance, without duplicates."""
+
+    return list(dict.fromkeys(rule for _, _, rule in rule_id_spans(_repair_split_ids(text))))
 
 
 def extract_headings(text: str) -> List[Tuple[int, str]]:
@@ -139,10 +145,11 @@ def extract_headings(text: str) -> List[Tuple[int, str]]:
     """
 
     headings: List[Tuple[int, str]] = []
+    keyword_ids: Set[int] = set()  # where a keyword heading's identifier starts, so it is not a dotted heading too
     for match in _KEYWORD_HEADING.finditer(text):
         value = match.group(2)
         headings.append((match.start(), _appendix(value) if match.group(1) == "APPENDIX" else normalise_rule_id(value)))
-    keyword_ids = {match.start(2) for match in _KEYWORD_HEADING.finditer(text)}
+        keyword_ids.add(match.start(2))
     for match in _DOTTED_HEADING.finditer(text):
         position = match.start(1)
         if position in keyword_ids or _REFERENCE_CONTEXT.search(text[max(0, position - 30) : position]):
@@ -157,14 +164,14 @@ def item_letters(text: str) -> Set[str]:
     return {m.lower() for m in re.findall(r"(?:^|[\s(])([a-z])(?:\.\s|\))", text)}
 
 
-def is_supported(rule: str, evidence_rules: Iterable[str], evidence_items: Optional[Set[str]] = None) -> bool:
+def is_supported(rule: str, evidence_rules: Iterable[str], evidence_items: Set[str]) -> bool:
     """A cited rule is supported if the evidence contains it or one of its sub-rules.
 
     ``B2.3`` is supported by evidence containing ``B2.3.5`` (a parent article),
     but ``B2.3.5.1`` is *not* supported by evidence that only contains ``B2.3.5``,
     and ``Appendix B2`` never supports ``Article B2``. A lettered item
-    (``B1.6.3a``) is supported by its article when ``evidence_items`` is not
-    given, or when that letter is used as an item marker in the evidence.
+    (``B1.6.3a``) is supported by its article when that letter is used as an
+    item marker in the evidence (``evidence_items``, see :func:`item_letters`).
     """
 
     target = normalise_rule_id(rule).lower()
@@ -176,7 +183,7 @@ def is_supported(rule: str, evidence_rules: Iterable[str], evidence_items: Optio
     base = re.sub(r"\.?[a-z]$", "", target)
     if base == target or not re.search(r"\d", base) or not _supported(base, evidence):
         return False
-    return evidence_items is None or target[-1] in evidence_items
+    return target[-1] in evidence_items
 
 
 def _supported(target: str, evidence: Iterable[str]) -> bool:

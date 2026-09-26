@@ -3,6 +3,7 @@ documented heuristic objective)."""
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -29,7 +30,6 @@ from core_modules.setup_optimizer.setup_recommender import (
     WeatherCondition,
     WeatherData,
     objective_terms,
-    recommend_setup,
     recommend_setup_from_inputs,
     refine_locally,
     _derive_context,
@@ -53,23 +53,17 @@ TWO_OPTIMA = (
     WeatherData(WeatherCondition.WET, 20.0),
 )
 
-API_PAYLOAD = {
-    "driver_preferences": {"risk_tolerance": 0.5, "tire_management": 0.7},
-    "track_profile": {
-        "track_name": "Silverstone Circuit",
-        "track_length": 5891,
-        "corners": 18,
-        "high_speed_sections": 8,
-        "low_speed_sections": 4,
-        "track_type": "high_speed",
-        "average_speed": 220,
-        "downforce_requirement": 0.6,
-    },
-    "weather": {"condition": "dry", "temperature": 24, "humidity": 50},
-}
+# The documented request example without its trial budget and seed, so the schema defaults apply.
+API_PAYLOAD = copy.deepcopy(SetupRequest.model_config["json_schema_extra"]["examples"][0])
+del API_PAYLOAD["n_trials"], API_PAYLOAD["seed"]
 
 OPTIMIZER = SetupOptimizer()
 CENTRE = {n: (lo + hi) / 2 for n, (lo, hi) in SETUP_BOUNDS.items()}
+
+
+def recommend_setup(**payload) -> dict:
+    """The request path of the API and the natural-language router: validate the body, then run the engine."""
+    return recommend_setup_from_inputs(SetupRequest.model_validate(payload).to_engine_inputs())
 
 
 def _flat_setup(result: dict) -> dict:
@@ -158,14 +152,13 @@ def test_larger_budget_with_same_seed_never_does_worse():
     large = OPTIMIZER.recommend_setup(NEUTRAL, SPA, DRY, n_trials=DEFAULT_N_TRIALS, seed=3)
 
     # Same seed -> the first trials are identical, so extra trials can only improve the best value.
-    assert large["best_trial_objective"] <= small["best_trial_objective"]
     assert large["best_trial_objective"] < small["best_trial_objective"]
 
 
 def test_when_tpe_loses_to_the_baseline_the_returned_setup_is_still_a_refined_search_result():
-    # Replaces the old "baseline is returned" test: the raw rule of thumb is no longer returned as the
-    # answer, because it is only one refinement start. With the minimum budget on Monaco this seed's
-    # TPE stage loses to the baseline, yet refinement reaches a much better setup.
+    # The raw rule of thumb is only one refinement start, never the answer itself. With the minimum budget
+    # on Monaco this seed's TPE stage loses to the rule-of-thumb baseline; the returned setup is still the
+    # refined search result, and a much better one.
     result = OPTIMIZER.recommend_setup(NEUTRAL, MONACO, DRY, n_trials=MIN_N_TRIALS, seed=0)
 
     assert result["best_trial_objective"] >= result["baseline_objective_value"]  # TPE lost ...
@@ -295,7 +288,7 @@ def test_refinement_is_deterministic_bounded_and_only_moves_free_parameters():
     first = refine_locally(corner, ctx, free)
     assert first == refine_locally(corner, ctx, free)
     setup, value, evaluations, converged = first
-    assert converged and 0 < evaluations
+    assert converged and evaluations > 0
     assert value < sum(objective_terms(corner, ctx).values())
     assert setup.rear_wing_angle == corner.rear_wing_angle
     for name, (lo, hi) in SETUP_BOUNDS.items():
@@ -447,7 +440,11 @@ def test_unmodelled_inputs_are_reported_and_do_not_change_the_setup():
         NEUTRAL, replace(SPA, track_name="renamed"), replace(DRY, humidity=5.0, wind_speed=20.0), n_trials=MIN_N_TRIALS
     )
 
-    assert set(base["inputs_not_modelled"]) >= {"weather.humidity", "weather.wind_speed"}
+    # Only inputs that were actually supplied are listed (DRY gives humidity but no wind speed).
+    assert base["inputs_not_modelled"] == ["track_profile.track_name (label only)", "weather.humidity"]
+    assert other["inputs_not_modelled"] == ["track_profile.track_name (label only)", "weather.humidity", "weather.wind_speed"]
+    bare = OPTIMIZER.recommend_setup(NEUTRAL, SPA, replace(DRY, humidity=None), n_trials=MIN_N_TRIALS)
+    assert bare["inputs_not_modelled"] == ["track_profile.track_name (label only)"]
     assert _flat_setup(other) == _flat_setup(base)
     assert other["objective_value"] == base["objective_value"]
 
@@ -586,10 +583,6 @@ def test_schema_round_trip_and_engine_conversion():
     assert inputs.weather.condition is WeatherCondition.DRY
     assert (inputs.n_trials, inputs.seed) == (MIN_N_TRIALS, 5)
 
-    via_schema = recommend_setup_from_inputs(inputs)
-    via_dicts = recommend_setup(**API_PAYLOAD, n_trials=MIN_N_TRIALS, seed=5)
-    assert via_schema == via_dicts
-
 
 def test_schema_defaults_and_preference_conversion():
     request = SetupRequest.model_validate(
@@ -620,17 +613,13 @@ def test_request_lists_the_driver_preference_defaults_it_assumed(preferences, as
     assert request.to_engine_inputs().assumed_defaults == tuple(assumed)
 
 
-def test_recommendation_reports_assumed_defaults_from_every_request_entry_point():
+def test_recommendation_reports_the_assumed_driver_preference_defaults():
     # Reviewer repro: driver_preferences {} silently used risk_tolerance=0.5 and tire_management=0.5.
     assumed = ["driver_preferences.risk_tolerance=0.5", "driver_preferences.tire_management=0.5"]
-    via_schema = recommend_setup_from_inputs(
-        SetupRequest.model_validate({**API_PAYLOAD, "driver_preferences": {}, "n_trials": MIN_N_TRIALS}).to_engine_inputs()
-    )
-    via_dicts = recommend_setup(**{**API_PAYLOAD, "driver_preferences": {}}, n_trials=MIN_N_TRIALS)
+    defaulted = recommend_setup(**{**API_PAYLOAD, "driver_preferences": {}}, n_trials=MIN_N_TRIALS)
 
-    assert via_schema == via_dicts
-    assert via_schema["assumed_defaults"] == assumed
-    assert f"Not supplied, so defaults were assumed: {', '.join(assumed)}." in via_schema["reasoning"]
+    assert defaulted["assumed_defaults"] == assumed
+    assert f"Not supplied, so defaults were assumed: {', '.join(assumed)}." in defaulted["reasoning"]
 
     explicit = recommend_setup(**API_PAYLOAD, n_trials=MIN_N_TRIALS)  # both preferences supplied
     assert explicit["assumed_defaults"] == [] and "assumed" not in explicit["reasoning"]
@@ -638,7 +627,7 @@ def test_recommendation_reports_assumed_defaults_from_every_request_entry_point(
     same_values = recommend_setup(
         **{**API_PAYLOAD, "driver_preferences": {"risk_tolerance": 0.5, "tire_management": 0.5}}, n_trials=MIN_N_TRIALS
     )
-    assert _flat_setup(same_values) == _flat_setup(via_schema)
+    assert _flat_setup(same_values) == _flat_setup(defaulted)
 
 
 def test_engine_inputs_without_assumed_defaults_still_work():
@@ -648,7 +637,7 @@ def test_engine_inputs_without_assumed_defaults_still_work():
     assert OPTIMIZER.recommend_setup(NEUTRAL, SPA, DRY, n_trials=MIN_N_TRIALS)["assumed_defaults"] == []
 
 
-def test_pinned_values_survive_the_dict_entry_point_unrounded():
+def test_pinned_values_survive_request_validation_unrounded():
     payload = _payload(driver_preferences={"preferred_ride_height": 72.345, "preferred_wing_angles": {"front": 4.125}})
     result = recommend_setup(**payload, n_trials=MIN_N_TRIALS)
 

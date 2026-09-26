@@ -7,20 +7,31 @@ nothing else: declines stay declines, and a rejected model output is only shown 
 
 from __future__ import annotations
 
-import re
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import streamlit as st
 
 from ui.api_client import ApiError, ApiUnavailable, get_client
 from ui.components import (
-    PROVIDER_STATUS_HELP,
+    DEFINITIONS_ONLY_NOTE,
     cached_health,
+    cites_regulation_passage,
     clear_health_cache,
+    code_span,
+    decline_explanation,
+    evidence_label,
     humanise,
+    index_metrics,
+    is_definition,
     json_expander,
+    location,
     md_text,
-    rag_fix_steps,
+    pdf_link,
+    provider_metric,
+    refresh_health_once,
+    render_passage,
+    render_rag_problems,
+    score_text,
     show_api_error,
     state_badge,
     uses_compose,
@@ -47,72 +58,20 @@ EXAMPLE_QUESTIONS: Tuple[Tuple[str, str], ...] = (
     ("Minimum mass", "What is the minimum mass of the car during the qualifying sessions?"),
     ("Factory shutdown", "What factory shutdown periods must F1 teams observe?"),
 )
-REPHRASE = "Rephrasing the question can help; the rejected text below is for inspection only."
-# decline_reason -> (headline, what happened, what the user can do)
-DECLINE_REASONS: Dict[str, Tuple[str, str, str]] = {
-    "no_evidence_above_threshold": (
-        "No passage was similar enough to the question",
-        "No regulation passage reached the similarity threshold, so the answer model was not called. The "
-        "question may be about something the regulations do not cover (race results, tickets, ...).",
-        "Use the regulations' own terms, or open **Search passages** to see the closest passages and their scores.",
-    ),
-    "model_declined": (
-        "The answer model found no answer in the evidence",
-        "The model read the retrieved passages and replied that they do not contain enough evidence.",
-        "Check the evidence below: if it does not cover the question, the regulations probably do not either. "
-        "Rephrasing or a larger top_k can bring in other passages.",
-    ),
-    "empty_model_output": (
-        "The answer model returned nothing",
-        "The model's reply was empty, so there was nothing to check.",
-        "Ask again; if it repeats, check the answer model and provider settings of the API.",
-    ),
-    "invalid_citation": (
-        "The answer cited a source that was not supplied",
-        "The model cited a source label that is not one of the retrieved passages, so its statements cannot "
-        "be traced to the regulations.",
-        REPHRASE,
-    ),
-    "missing_citation": (
-        "The answer cited no source",
-        "Every statement must cite the passages it relies on; this answer cited none of them.",
-        REPHRASE,
-    ),
-    "unsupported_rule_reference": (
-        "The answer named a rule that is not in its sources",
-        "The answer mentions an article or rule number that does not occur in the passages it cites, so it "
-        "may be invented or misattributed.",
-        REPHRASE,
-    ),
-    "uncited_claim": (
-        "Part of the answer had no citation",
-        "The answer made at least one statement without citing a passage for it.",
-        REPHRASE,
-    ),
-    "unsupported_number": (
-        "The answer stated a number that is not in its sources",
-        "The answer contains a number (a limit, penalty, amount or time) that does not occur in the passages "
-        "it cites. A number repeated only from the question counts too.",
-        REPHRASE,
-    ),
-    "truncated_model_output": (
-        "The answer was cut off",
-        "The model's reply reached its output limit and could end mid-sentence; incomplete answers are never shown.",
-        "Ask a narrower question, or raise `FIA_RAG_MAX_OUTPUT_TOKENS` for the API.",
-    ),
-    "unverified_claim": (
-        "The claim check failed",
-        "The claim verifier (`FIA_RAG_VERIFY_CLAIMS`) found sentences the cited passages do not support, or "
-        "its reply could not be read.",
-        REPHRASE,
+# A truncated_model_output decline names what stopped the reply (validation.finish_reason) ->
+# (what happened, what the user can do). Providers call the output limit "length" or "max_tokens".
+_OUTPUT_LIMIT = (
+    "The model's reply reached its output limit and could end mid-sentence; incomplete answers are never shown.",
+    "Ask a narrower question, or raise `FIA_RAG_MAX_OUTPUT_TOKENS` for the API.",
+)
+FINISH_REASONS: Dict[str, Tuple[str, str]] = {
+    "length": _OUTPUT_LIMIT,
+    "max_tokens": _OUTPUT_LIMIT,
+    "content_filter": (
+        "The provider's content filter stopped the model's reply before it finished; incomplete answers are never shown.",
+        "Rephrasing the question can help; a higher output limit does not.",
     ),
 }
-# A truncated_model_output decline whose rejected output starts with "[finish_reason=content_filter]".
-CONTENT_FILTERED = (
-    "The provider's content filter stopped the model's reply before it finished; incomplete answers are never shown.",
-    "Rephrasing the question can help; a higher output limit does not.",
-)
-_FINISH_REASON = re.compile(r"\[finish_reason=([^\]]*)\]")
 # validation field -> label, shown for rejected answers and in the validation details
 VALIDATION_LISTS: Tuple[Tuple[str, str], ...] = (
     ("invalid_citations", "Cited labels that were not supplied"),
@@ -123,24 +82,6 @@ VALIDATION_LISTS: Tuple[Tuple[str, str], ...] = (
 )
 EVIDENCE_COLOR = "#2a78d6"  # passages above the threshold
 BELOW_THRESHOLD_COLOR = "#898781"  # greyed: retrieved, but not evidence
-# The API's citation grammar (fia_rag/grounding.py), so that every citation it accepted becomes a badge:
-# [S1], [1], [S1, S3], [S1-S3], [source: S7], (S7), (source S7), "according to source S2".
-_NUMBER = r"\d{1,6}"
-_ITEM_SEP = r"\s*(?:,|;|/|&|\band\b)\s*"
-_RANGE_SEP = r"\s*(?:-|–|—|\bto\b)\s*"
-_LABEL_TOKEN = rf"(?:(?:sources?|src|refs?|excerpts?|passages?)\s*[:#]?\s*)?S?\s*{_NUMBER}"
-_LABEL_LIST = rf"{_LABEL_TOKEN}(?:(?:{_ITEM_SEP}|{_RANGE_SEP}){_LABEL_TOKEN})*"
-_BRACKET_CITATION = re.compile(rf"[\[【〔［]\s*({_LABEL_LIST})\s*[\]】〕］]", re.IGNORECASE)
-_PAREN_CITATION = re.compile(  # an explicit S or "source" is required: "one (1) hour" is not a citation
-    rf"[(（]\s*((?:(?:sources?|excerpts?)\s*[:#]?\s*S?\s*|S\s*){_NUMBER}"
-    rf"(?:(?:{_ITEM_SEP}|{_RANGE_SEP}){_LABEL_TOKEN})*)\s*[)）]",
-    re.IGNORECASE,
-)
-_PROSE_CITATION = re.compile(rf"\b(?:excerpts?|sources?|passages?)\s+(S?\s*{_NUMBER})\b", re.IGNORECASE)
-# (pattern, the group a badge replaces: 0 is the whole match; a prose citation keeps its word "source")
-_CITATIONS = ((_BRACKET_CITATION, 0), (_PAREN_CITATION, 0), (_PROSE_CITATION, 1))
-_CITATION_PARTS = re.compile(rf"({_NUMBER})|({_RANGE_SEP})|{_ITEM_SEP}", re.IGNORECASE)
-_SAFE_URL = re.compile(r"https?://[^\s()<>\"'`]+")
 _RESYNCED_KEY = "_f1_regulations_resynced"
 ASK_OUTCOME_KEY = "_f1_fia_ask_outcome"  # last answer or API error, kept for the session
 SEARCH_OUTCOME_KEY = "_f1_fia_search_outcome"
@@ -152,142 +93,35 @@ Outcome = Union[Dict[str, Any], ApiUnavailable, ApiError]
 # ------------------------------------------------------------------ formatting
 
 
-def code(value: Any) -> str:
-    return f"`{str(value).replace('`', '')}`"
-
-
-def score_text(score: Any) -> str:
-    return f"{score:.3f}" if isinstance(score, (int, float)) else "–"
-
-
-def is_definition(passage: Dict[str, Any]) -> bool:
-    return passage.get("kind") == "definition"
-
-
-def pdf_link(passage: Dict[str, Any]) -> Optional[str]:
-    """The official PDF URL, opened at the passage's PDF page; None unless it is a plain http(s) URL."""
-
-    url = passage.get("source_url")
-    if not isinstance(url, str) or not _SAFE_URL.fullmatch(url):
-        return None
-    page = passage.get("page")
-    return f"{url}#page={page}" if isinstance(page, int) else url
-
-
-def location(passage: Dict[str, Any]) -> str:
-    parts = []
-    if passage.get("section"):
-        parts.append(f"Section {passage['section']}")
-    if passage.get("page_label"):
-        parts.append(f"printed page {passage['page_label']}")
-    if passage.get("page") is not None:
-        parts.append(f"PDF page {passage['page']}")
-    return " · ".join(parts) or "location unknown"
-
-
 def reference(passage: Dict[str, Any]) -> str:
-    """Short identity of a passage: nearest rule (or defined term) and printed page."""
+    """Short identity of a passage: nearest rule (or defined term) and printed page (plain text, not Markdown)."""
 
     subject = passage.get("defined_term") if is_definition(passage) else passage.get("nearest_rule")
     page = passage.get("page_label") or (f"PDF p. {passage['page']}" if passage.get("page") is not None else None)
     return " · ".join(str(part) for part in (subject or "no rule heading", page) if part)
 
 
-def cited_note(grounded: bool) -> str:
-    return "cited" if grounded else "cited by the rejected output"
+def with_citation_chips(answer: str, spans: Sequence[Dict[str, Any]]) -> str:
+    """Markdown for an answer: the API text as written, each citation the API located as a badge of its labels.
 
-
-def answer_text(text: str) -> str:
-    """A model answer for Markdown: like ``md_text`` (no links, HTML or directives), but its bold and italics show."""
-
-    parts = text.split("`")
-    if len(parts) % 2 == 0:  # unbalanced backticks: escape everything
-        parts = ["`".join(parts)]
-    for index in range(0, len(parts), 2):
-        for char in "\\[]<>#:$~|`":
-            parts[index] = parts[index].replace(char, "\\" + char)
-    return "`".join(parts)
-
-
-def citation_badge(group: str) -> str:
-    """A badge with the API's normalised labels: "[source: 2 & 3]" -> S2, S3; "[S1-S3]" -> S1–S3."""
-
-    labels = ""
-    for match in _CITATION_PARTS.finditer(group):
-        number, range_sep = match.groups()
-        if number:
-            labels += f"S{int(number)}"
-        elif labels:
-            labels += "–" if range_sep else ", "
-    return f":blue-badge[{labels}]"
-
-
-def citation_spans(answer: str) -> List[Tuple[int, int, str]]:
-    """(start, end, label group) of each citation, in text order; overlaps go to the earlier span."""
-
-    found = sorted(
-        (match.start(group), match.end(group), match.group(1))
-        for pattern, group in _CITATIONS
-        for match in pattern.finditer(answer)
-    )
-    spans: List[Tuple[int, int, str]] = []
-    for span in found:
-        if not spans or span[0] >= spans[-1][1]:
-            spans.append(span)
-    return spans
-
-
-def with_citation_chips(answer: str) -> str:
-    """Markdown for an answer: the API text as written, each citation as a badge of its S# labels."""
+    ``spans`` is the answer's ``citation_spans``: where each citation is written in it and the labels it names
+    ("[source: 2 & 3]" -> S2, S3; "[S1-S3]" -> S1, S2, S3; in "source S2" only the label is replaced).
+    """
 
     text = ""
     last = 0
-    for start, end, group in citation_spans(answer):
-        text += answer_text(answer[last:start])
+    for span in spans:
+        start, end = span["start"], span["end"]
+        if not last <= start < end <= len(answer):  # malformed: show the text as written
+            continue
+        text += md_text(answer[last:start], keep_emphasis=True)
         separator = "" if not text or text[-1].isspace() else " "  # "[S1][S3]": a badge needs a space before it
-        text += separator + citation_badge(group)
+        text += separator + f":blue-badge[{md_text(', '.join(span['labels']))}]"
         last = end
-    return text + answer_text(answer[last:])
+    return text + md_text(answer[last:], keep_emphasis=True)
 
 
 # ------------------------------------------------------------------ passages
-
-
-def render_passage(passage: Dict[str, Any], grounded: bool = True) -> None:
-    """Badges, location, verbatim text and the official PDF link of one passage."""
-
-    badges = []
-    if passage.get("label"):
-        badges.append(f":blue-badge[{md_text(passage['label'])}]")
-    if passage.get("cited"):
-        badges.append(f":{'green' if grounded else 'orange'}-badge[{cited_note(grounded)}]")
-    if is_definition(passage):
-        badges.append(":violet-badge[definition]")
-        details = [f"defined term **{md_text(passage.get('defined_term') or 'unknown')}**", md_text(location(passage))]
-    else:
-        badges.append(":gray-badge[regulation passage]")
-        details = [md_text(location(passage)), f"similarity {score_text(passage.get('score'))}"]
-        if passage.get("nearest_rule"):
-            details.insert(1, f"nearest rule {code(passage['nearest_rule'])}")
-    st.markdown(" ".join(badges) + " " + " · ".join(details))
-    if is_definition(passage):
-        st.markdown(
-            "An official definition of a term the passages use or the question names. It is added to the "
-            "evidence, not retrieved by similarity, so its score is not a similarity."
-        )
-    st.markdown("> " + md_text(passage.get("text", "")).replace("\n", "\n> "))
-    link = pdf_link(passage)
-    source = md_text(passage.get("source") or "unknown file")
-    st.caption(f"Source: [{source}, official FIA PDF]({link})" if link else f"Source: {source} (no official URL recorded)")
-
-
-def evidence_label(passage: Dict[str, Any], grounded: bool) -> str:
-    parts = [str(passage.get("label", "?")), cited_note(grounded) if passage.get("cited") else ""]
-    if is_definition(passage):
-        parts += [f"definition: {passage.get('defined_term') or 'unknown'}", location(passage)]
-    else:
-        parts += [passage.get("nearest_rule") or "", location(passage), f"similarity {score_text(passage.get('score'))}"]
-    return " · ".join(part for part in parts if part)
 
 
 def evidence_table(passages: Sequence[Dict[str, Any]], grounded: bool) -> None:
@@ -333,7 +167,7 @@ def render_below_threshold(
     with st.expander(f"Below the threshold ({len(passages)}): {note}", expanded=expanded):
         st.caption(f"Similarity under {score_text(min_score)}. Listed for inspection only; they are not evidence.")
         for rank, passage in enumerate(passages, start=first_rank):
-            rule = f" · {code(passage['nearest_rule'])}" if passage.get("nearest_rule") else ""
+            rule = f" · {code_span(passage['nearest_rule'])}" if passage.get("nearest_rule") else ""
             st.caption(
                 f"**#{rank} · similarity {score_text(passage.get('score'))}** · {md_text(location(passage))}{rule} · "
                 f"{md_text(passage.get('source') or '')}"
@@ -350,7 +184,7 @@ def render_citations(citations: Sequence[str], by_label: Dict[str, Dict[str, Any
     with st.container(horizontal=True, gap="small"):
         for label in citations:
             if label in by_label:
-                with st.popover(f"{label} · {reference(by_label[label])}", icon=":material/format_quote:"):
+                with st.popover(f"{label} · {md_text(reference(by_label[label]))}", icon=":material/format_quote:"):
                     render_passage(by_label[label])
 
 
@@ -359,12 +193,9 @@ def render_decline(body: Dict[str, Any]) -> None:
     validation = body.get("validation") or {}
     retrieval = body.get("retrieval") or {}
     rejected = validation.get("rejected_model_output")
-    headline, happened, next_step = DECLINE_REASONS.get(
-        reason, (f"Declined ({md_text(humanise(reason))})", "The API declined to answer.", "")
-    )
-    finish = _FINISH_REASON.match(rejected or "")
-    if reason == "truncated_model_output" and finish and finish.group(1) == "content_filter":
-        happened, next_step = CONTENT_FILTERED
+    headline, happened, next_step = decline_explanation(reason)
+    if reason == "truncated_model_output" and validation.get("finish_reason") in FINISH_REASONS:
+        happened, next_step = FINISH_REASONS[validation["finish_reason"]]
     with st.container(border=True, key="fia_decline_card"):
         st.badge("Declined: no answer is shown", icon=":material/block:", color="orange")
         st.markdown(f"**{headline}**")
@@ -380,7 +211,7 @@ def render_decline(body: Dict[str, Any]) -> None:
                 st.markdown(f"{label}:\n" + "\n".join(f"- {md_text(value)}" for value in values))
         if next_step:
             st.markdown(f"**What you can do:** {next_step}")
-        st.caption(f"Reason code {code(reason)}. API message: {md_text(body.get('answer', ''))}")
+        st.caption(f"Reason code {code_span(reason)}. API message: {md_text(body.get('answer', ''))}")
         if rejected:
             with st.expander("Rejected model output: failed validation, not an answer", key="fia_rejected_output"):
                 st.markdown("Shown for inspection only. It is not a statement of the regulations.")
@@ -395,8 +226,8 @@ def render_validation(body: Dict[str, Any]) -> None:
         rules = body.get("referenced_rules") or []
         lines = [
             "Referenced rules (each found in the cited passages): "
-            + (", ".join(code(rule) for rule in rules) if rules else "none"),
-            "Citations: " + (", ".join(code(label) for label in body.get("citations") or []) or "none"),
+            + (", ".join(code_span(rule) for rule in rules) if rules else "none"),
+            "Citations: " + (", ".join(code_span(label) for label in body.get("citations") or []) or "none"),
         ]
         for field, label in VALIDATION_LISTS:
             values = validation.get(field) or []
@@ -417,7 +248,8 @@ def render_validation(body: Dict[str, Any]) -> None:
             f"Retrieval: top_k {retrieval.get('top_k')} · threshold {score_text(retrieval.get('min_score'))} · "
             f"passages above it: {retrieval.get('passages_above_threshold')} · definitions added: "
             f"{retrieval.get('definitions_added')} · duplicates removed: {retrieval.get('duplicates_removed')}. "
-            f"Embedding model {code(models.get('embedding'))}, answer model {code(models.get('generation') or 'not called')}."
+            f"Embedding model {code_span(models.get('embedding'))}, answer model "
+            f"{code_span(models.get('generation') or 'not called')}."
         )
 
 
@@ -445,11 +277,10 @@ def render_answer(body: Dict[str, Any]) -> None:
         citations = body.get("citations") or []
         with st.container(border=True, key="fia_answer_card"):
             st.badge("Grounded answer", icon=":material/verified:", color="green")
-            st.markdown(with_citation_chips(body.get("answer", "")))
+            st.markdown(with_citation_chips(body.get("answer", ""), body.get("citation_spans") or []))
             render_citations(citations, {p.get("label"): p for p in passages})
             st.markdown(checks_note((body.get("validation") or {}).get("claim_verification")))
-        # The API counts cited regulation passages only: definitions have no similarity.
-        regulation_cited = any(p.get("cited") and not is_definition(p) for p in passages)
+        regulation_cited = cites_regulation_passage(passages)
         columns = st.columns(3)
         columns[0].metric(
             "Evidence strength",
@@ -464,10 +295,7 @@ def render_answer(body: Dict[str, Any]) -> None:
                 "probability: it says how close they are to the question, not whether the answer is right."
             )
         else:
-            st.markdown(
-                "Only official definitions were cited. Definitions are not retrieved by similarity, so there is no "
-                "evidence strength to report."
-            )
+            st.markdown(DEFINITIONS_ONLY_NOTE)
     else:
         render_decline(body)
     st.subheader("Evidence given to the model")
@@ -594,7 +422,7 @@ def render_retrieval(body: Dict[str, Any], default_min_score: Any) -> None:
             else "None at this threshold."
         )
     for rank, passage in enumerate(passages, start=1):
-        with st.expander(f"#{rank} · {reference(passage)} · similarity {score_text(passage.get('score'))}"):
+        with st.expander(f"#{rank} · {md_text(reference(passage))} · similarity {score_text(passage.get('score'))}"):
             render_passage(passage)
     note = "retrieved, would not be given to the model" if as_ask else "retrieved, not evidence at this threshold"
     render_below_threshold(below, min_score, note, len(passages) + 1, expanded=True)
@@ -607,7 +435,7 @@ def render_retrieval(body: Dict[str, Any], default_min_score: Any) -> None:
             "the evidence and are never evidence alone."
         )
         for passage in definitions:
-            with st.expander(f"{passage.get('defined_term') or 'Definition'} · {location(passage)}"):
+            with st.expander(md_text(f"{passage.get('defined_term') or 'Definition'} · {location(passage)}")):
                 render_passage(passage)
     json_expander(body)
 
@@ -629,8 +457,6 @@ def render_index_status(fia: Dict[str, Any], base_url: str) -> None:
 
     state = fia.get("state")
     settings = fia.get("settings") or {}
-    index = fia.get("index") or {}
-    glossary = index.get("glossary") or {}
     with st.container(border=True):
         head, refresh = st.columns([5, 1], vertical_alignment="center")
         head.markdown(f"{state_badge(state)} **Regulation index**")
@@ -640,33 +466,20 @@ def render_index_status(fia: Dict[str, Any], base_url: str) -> None:
         if settings:  # absent when the settings themselves are invalid
             with st.container(horizontal=True, gap="medium"):  # wraps on a phone instead of stacking five rows
                 st.metric("Documents", len(fia.get("documents") or []), width="content")
-                st.metric("Indexed passages", "–" if index.get("points") is None else index["points"], width="content")
-                entries = glossary.get("entries")
-                st.metric(
-                    "Definitions",
-                    humanise(glossary.get("status", "unknown")) if entries is None else entries,
-                    help="Official definitions of defined terms, added to the evidence when passages use them",
-                    width="content",
-                )
+                index_metrics(fia.get("index") or {})
                 st.metric(
                     "Claim verifier",
                     "on" if settings.get("verify_claims") else "off",
                     help="FIA_RAG_VERIFY_CLAIMS: a second model call checks every sentence of an accepted answer",
                     width="content",
                 )
-                st.metric(
-                    "Model provider", humanise(fia.get("provider_status", "unknown")), help=PROVIDER_STATUS_HELP, width="content"
-                )
+                provider_metric(fia)
             st.caption(
-                f"Embedding model {code(settings.get('embedding_model'))} · answer model "
-                f"{code(settings.get('generation_model'))} · default top_k {settings.get('top_k')} · similarity "
+                f"Embedding model {code_span(settings.get('embedding_model'))} · answer model "
+                f"{code_span(settings.get('generation_model'))} · default top_k {settings.get('top_k')} · similarity "
                 f"threshold {score_text(settings.get('min_score'))}"
             )
-        for problem in fia.get("problems") or []:
-            st.warning(md_text(problem), icon=":material/report:")
-        steps = rag_fix_steps(fia, uses_compose(base_url, settings))
-        if steps:
-            st.markdown("**Next steps** (from the project folder):\n" + "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1)))
+        render_rag_problems(fia, uses_compose(base_url, settings))
         if is_blocked(fia):
             st.info(
                 "Asking and searching are disabled until the index is ready. Results from earlier in this session stay visible.",
@@ -686,16 +499,6 @@ def sidebar_state() -> Optional[str]:
         return (cached_health().get("modules") or {}).get("fia_rag")
     except (ApiUnavailable, ApiError):
         return None
-
-
-def keep_sidebar_in_step(shown: Optional[str], state: Optional[str]) -> None:
-    """Refresh the sidebar (drawn before this page, from a snapshot) once when it shows another state."""
-
-    resynced = st.session_state.pop(_RESYNCED_KEY, False)
-    if shown != state and not resynced:
-        clear_health_cache()
-        st.session_state[_RESYNCED_KEY] = True
-        st.rerun()
 
 
 def follow_api_defaults(settings: Dict[str, Any]) -> None:
@@ -881,4 +684,4 @@ with status_slot:
     else:
         show_api_error(status, "The regulation index status check")
 if isinstance(status, dict):
-    keep_sidebar_in_step(shown_state, status.get("state"))
+    refresh_health_once(_RESYNCED_KEY, shown_state != status.get("state"))

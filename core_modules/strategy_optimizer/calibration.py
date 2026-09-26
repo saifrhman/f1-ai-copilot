@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -86,6 +86,7 @@ from .strategy_engine import (
     _number,
     _temperature_multiplier,
     _validate_tire,
+    _warm_up_factor,
     _weather_multiplier,
 )
 
@@ -260,6 +261,29 @@ def _validate_laps(laps: Any) -> List[LapRecord]:
     return [_validate_lap(index, lap) for index, lap in enumerate(laps)]
 
 
+# Cross-field rules. ``schemas.TyreCalibrationRequest`` calls these too, so each rule and its message exist once.
+
+
+def check_override_has_laps(name: str, compound: TireCompound, present: Collection[TireCompound]) -> None:
+    if compound not in present:
+        raise ValueError(f"{name} is given for '{compound.value}', which has no laps")
+
+
+def check_fuel_race_laps(laps: Sequence[Any], fuel_correction_s_per_lap: float) -> None:
+    """A fuel correction needs ``race_lap`` on every unflagged lap (``LapRecord`` or request lap objects)."""
+
+    if fuel_correction_s_per_lap > 0.0:
+        missing = [
+            index
+            for index, lap in enumerate(laps)
+            if lap.race_lap is None and not any(getattr(lap, flag) for flag in LAP_FLAGS)
+        ]
+        if missing:
+            raise ValueError(
+                f"fuel_correction_s_per_lap needs race_lap on every unflagged lap; missing on laps{missing[:10]}"
+            )
+
+
 def _validate_overrides(
     name: str, overrides: Any, low: int, high: int, present: Sequence[TireCompound]
 ) -> Dict[TireCompound, int]:
@@ -272,8 +296,7 @@ def _validate_overrides(
         compound = _enum(TireCompound, f"{name} key", key)
         if compound in clean:
             raise ValueError(f"{name} contains compound '{compound.value}' more than once")
-        if compound not in present:
-            raise ValueError(f"{name} is given for '{compound.value}', which has no laps")
+        check_override_has_laps(name, compound, present)
         clean[compound] = _integer(f"{name}[{compound.value}]", value, low, high)
     return clean
 
@@ -316,14 +339,6 @@ class _CompoundFit:
         """Lowest engine performance (conditions factor included) over the laps used, for this base lap time."""
 
         return float(np.min(base_lap_time / self.fitted[self.inliers]))
-
-
-def _warm_up_factor(ages: np.ndarray, warm_up: int) -> np.ndarray:
-    factor = np.ones(len(ages))
-    if warm_up > 0:
-        warming = ages <= warm_up
-        factor[warming] = 0.90 + 0.10 * ages[warming] / warm_up
-    return factor
 
 
 def _laps_past_window(ages: np.ndarray, warm_up: int, peak_end: Any) -> np.ndarray:
@@ -849,6 +864,7 @@ def estimate_tire_parameters(
     present = sorted({lap.compound for lap in records}, key=_COMPOUND_ORDER.index)
     supplied_ends = _validate_overrides("peak_window_end", peak_window_end, 1, MAX_TOTAL_LAPS, present)
     supplied_warm_up = _validate_overrides("warm_up_laps", warm_up_laps, 0, MAX_WARM_UP_LAPS, present)
+    check_fuel_race_laps(records, fuel)
 
     excluded: List[ExcludedLap] = []
     clean: List[int] = []
@@ -862,18 +878,7 @@ def estimate_tire_parameters(
     corrected = {index: records[index].lap_time for index in clean}
     fuel_reference: Optional[int] = None
     if fuel > 0.0 and clean:
-        race_laps: Dict[int, int] = {}
-        missing: List[int] = []
-        for index in clean:
-            race_lap = records[index].race_lap
-            if race_lap is None:
-                missing.append(index)
-            else:
-                race_laps[index] = race_lap
-        if missing:
-            raise ValueError(
-                f"fuel_correction_s_per_lap needs race_lap on every unflagged lap; missing on laps{missing[:10]}"
-            )
+        race_laps = {index: records[index].race_lap for index in clean}  # all given (check_fuel_race_laps)
         fuel_reference = max(race_laps.values())
         for index in clean:
             value = records[index].lap_time - fuel * (fuel_reference - race_laps[index])

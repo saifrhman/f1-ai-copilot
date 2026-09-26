@@ -1,4 +1,9 @@
-"""Shared Streamlit building blocks: page registry, API and form error display, labels and the status sidebar."""
+"""Shared Streamlit building blocks: the page registry, text and error display, form submission, radio
+clips, regulation passages and declines, the regulation index status, and the status sidebar.
+
+Everything that more than one page shows lives here: a page script cannot import another page (importing
+it would run it).
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 from urllib.parse import urlsplit
 
 import streamlit as st
@@ -22,10 +27,6 @@ HEALTH_TTL_S = 30.0
 FAILED_HEALTH_TTL_S = 10.0
 _HEALTH_KEY = "_f1_health_snapshot"
 _SCHEMA_KEY = "_f1_openapi"
-# Pydantic's error text, which the API returns as one string when a module validates a request itself
-# (e.g. the strategy or setup context of a natural-language question).
-_PYDANTIC_HEADER = re.compile(r"\d+ validation errors? for \w+")
-_PYDANTIC_DETAILS = re.compile(r"\s+\[type=.*\]$")
 
 
 class PageSpec(NamedTuple):
@@ -107,16 +108,87 @@ PROVIDER_STATUS_HELP = (
 # The API's limit on decoded radio audio (MAX_AUDIO_BYTES in core_modules/driver_emotion), checked before
 # sending, and the clip formats it decodes (M4A and WebM need ffmpeg where the API runs).
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
+MAX_AUDIO_TEXT = f"{MAX_AUDIO_BYTES // 2**20} MiB"
 AUDIO_TYPES = ["wav", "flac", "ogg", "mp3", "m4a", "webm"]
+UPLOAD, RECORD = "Upload a file", "Record"  # where a radio clip comes from
+CLIP_SOURCES = [UPLOAD, RECORD]
 DEFAULT_DOCS_PATH = "data/fia_docs"  # FIA_DOCS_PATH default of the API and of scripts/fetch_fia_regulations.py
-# How the API scores the acoustic emotion label (label_from_scores in core_modules/driver_emotion).
-ACOUSTIC_CONFIDENCE_RULE = (
-    "0.45 × the best profile similarity + 0.55 × its lead over the runner-up, at most 0.95; below 0.20, or "
-    "when two profiles tie for the best similarity, the acoustic label is neutral"
-)
 # A lead over the runner-up profile below this is too small for the audio to separate the two.
 CLOSE_PROFILE_LEAD = 0.05
 EXAMPLE_INPUTS_BADGE = "Example inputs · not your data"
+KEEP = "session"  # form values survive page switches (persist_state)
+
+REPHRASE = "Rephrasing the question can help."
+# decline_reason of the regulation QA -> (headline, what happened, what the user can do), on the FIA
+# regulations and Ask the copilot pages.
+DECLINE_REASONS: Dict[str, Tuple[str, str, str]] = {
+    "no_evidence_above_threshold": (
+        "No passage was similar enough to the question",
+        "No regulation passage reached the similarity threshold, so the answer model was not called. The "
+        "question may be about something the regulations do not cover (race results, tickets, ...).",
+        "Use the regulations' own terms, or run **Search passages** on the FIA regulations page to see the closest "
+        "passages and their scores.",
+    ),
+    "model_declined": (
+        "The answer model found no answer in the evidence",
+        "The model read the retrieved passages and replied that they do not contain enough evidence.",
+        "Check the evidence below: if it does not cover the question, the regulations probably do not either. "
+        "Rephrasing, or a larger top_k on the FIA regulations page, can bring in other passages.",
+    ),
+    "empty_model_output": (
+        "The answer model returned nothing",
+        "The model's reply was empty, so there was nothing to check.",
+        "Ask again; if it repeats, check the answer model and provider settings of the API.",
+    ),
+    "invalid_citation": (
+        "The answer cited a source that was not supplied",
+        "The model cited a source label that is not one of the retrieved passages, so its statements cannot "
+        "be traced to the regulations.",
+        REPHRASE,
+    ),
+    "missing_citation": (
+        "The answer cited no source",
+        "Every statement must cite the passages it relies on; this answer cited none of them.",
+        REPHRASE,
+    ),
+    "unsupported_rule_reference": (
+        "The answer named a rule that is not in its sources",
+        "The answer mentions an article or rule number that does not occur in the passages it cites, so it "
+        "may be invented or misattributed.",
+        REPHRASE,
+    ),
+    "uncited_claim": (
+        "Part of the answer had no citation",
+        "The answer made at least one statement without citing a passage for it.",
+        REPHRASE,
+    ),
+    "unsupported_number": (
+        "The answer stated a number that is not in its sources",
+        "The answer contains a number (a limit, penalty, amount or time) that does not occur in the passages "
+        "it cites. A number repeated only from the question counts too.",
+        REPHRASE,
+    ),
+    "truncated_model_output": (
+        "The answer was cut off",
+        "The model's reply stopped before it finished, at its output limit or by the provider's content filter; "
+        "incomplete answers are never shown.",
+        "Ask a narrower question. If the output limit stopped it (the FIA regulations page says which one did), "
+        "raise `FIA_RAG_MAX_OUTPUT_TOKENS` for the API.",
+    ),
+    "unverified_claim": (
+        "The claim check failed",
+        "The claim verifier (`FIA_RAG_VERIFY_CLAIMS`) found sentences the cited passages do not support, or "
+        "its reply could not be read.",
+        REPHRASE,
+    ),
+}
+# The official PDF link of a passage (source_url, from the user-editable manifest): a plain http(s) URL that
+# cannot break out of a Markdown link.
+SAFE_URL = re.compile(r"https?://[^\s()<>\[\]\"'`]+")
+DEFINITIONS_ONLY_NOTE = (
+    "Only official definitions were cited. Definitions are not retrieved by similarity, so there is no evidence "
+    "strength to report."
+)
 
 # Where docker-compose.yml publishes the API service ("api") on the computer running it.
 COMPOSE_PUBLISHED_API_URL = "http://127.0.0.1:8000"
@@ -148,16 +220,50 @@ def state_badge(state: Optional[str]) -> str:
     return f":{color}-badge[{md_text(humanise(state))}]"
 
 
-def md_text(text: Any) -> str:
-    """API text for Markdown: shown literally (no emphasis, links, HTML or directives), `code spans` kept."""
+def md_text(text: Any, keep_emphasis: bool = False) -> str:
+    """API text for Markdown: shown literally (no emphasis, links, HTML or directives), `code spans` kept.
 
+    With ``keep_emphasis`` (a model answer), bold and italics still show.
+    """
+
+    special = "\\[]<>#:$~|`" if keep_emphasis else "\\*_[]<>#:$~|`"
     parts = str(text).split("`")
     if len(parts) % 2 == 0:  # unbalanced backticks: escape everything
         parts = ["`".join(parts)]
     for index in range(0, len(parts), 2):
-        for char in "\\*_[]<>#:$~|`":
+        for char in special:
             parts[index] = parts[index].replace(char, "\\" + char)
     return "`".join(parts)
+
+
+def code_span(value: Any) -> str:
+    """A value (file, column or rule name) as a Markdown code span."""
+
+    return "`" + str(value).replace("`", "'") + "`"
+
+
+def not_modelled_text(items: Sequence[Any]) -> str:
+    """Inputs a response lists as accepted but not modelled, as one Markdown line ("; " since an item can hold commas)."""
+
+    return "Accepted but not modelled: " + "; ".join(md_text(item) for item in items)
+
+
+def score_text(score: Any) -> str:
+    """A similarity score with three decimals; "–" when there is none."""
+
+    return f"{score:.3f}" if isinstance(score, (int, float)) else "–"
+
+
+def round4(value: Optional[float]) -> Optional[float]:
+    """A form number rounded to 4 decimals (slider and step arithmetic leaves float noise); None stays None."""
+
+    return None if value is None else round(float(value), 4)
+
+
+def clock_time(epoch: float) -> str:
+    """A ``time.time()`` value as this computer's clock time."""
+
+    return time.strftime("%H:%M:%S", time.localtime(epoch))
 
 
 def local_time(timestamp: Any) -> str:
@@ -185,26 +291,6 @@ def json_expander(data: Any, label: str = "Raw API response") -> None:
 def page_links(names: Sequence[str]) -> None:
     for name in names:
         st.page_link(app_page(name), help=PAGES[name].summary)
-
-
-def validation_lines(detail: str) -> List[str]:
-    """Pydantic's multi-line error text as one ``field: message`` line per error; [] for any other text."""
-
-    lines = detail.splitlines()
-    if not lines or not _PYDANTIC_HEADER.fullmatch(lines[0].strip()):
-        return []
-    errors: List[str] = []
-    field: Optional[str] = None
-    for line in lines[1:]:
-        if not line.strip() or line.startswith("    "):  # "For further information visit ..." links
-            continue
-        if line.startswith("  "):
-            message = _PYDANTIC_DETAILS.sub("", line.strip()).removeprefix("Value error, ")
-            errors.append(f"{field}: {message}" if field else message)
-            field = None
-        else:
-            field = line.strip()
-    return errors
 
 
 class FieldLabels:
@@ -249,7 +335,7 @@ class FieldLabels:
             token = match.group(0)
             return self.label(token) if all(part in self.labels for part in token.split(".")) else token
 
-        return self._IDENTIFIER.sub(label, text.removeprefix("Value error, "))
+        return self._IDENTIFIER.sub(label, text)
 
     def errors(self, errors: Sequence[str]) -> List[str]:
         """The API's validation lines (``path: message``) as Markdown, with the form's labels for field names."""
@@ -260,7 +346,6 @@ class FieldLabels:
             if not separator:
                 lines.append(md_text(error))
                 continue
-            message = message.removeprefix("Value error, ")
             lead = self._IDENTIFIER.match(message)
             if path == "request body":
                 lines.append(md_text(self.message(message)))
@@ -270,6 +355,13 @@ class FieldLabels:
             else:
                 lines.append(f"**{md_text(self.label(path))}**: {md_text(self.message(message))}")
         return lines
+
+
+def show_input_problems(problems: Sequence[str]) -> None:
+    """Problems a page found in its inputs before sending anything (plain text, `code spans` kept)."""
+
+    st.error("Nothing was sent to the API. Please fix:", icon=":material/edit_note:")
+    st.markdown("\n".join(f"- {md_text(problem)}" for problem in problems))
 
 
 def show_request_error(exc: Union[ApiUnavailable, ApiError], action: str, fields: FieldLabels) -> None:
@@ -296,9 +388,8 @@ def show_api_error(exc: Union[ApiUnavailable, ApiError], action: str = "The requ
         st.caption("Correct that value and submit again.")
         return
     if exc.status_code == 422:
-        lines = exc.errors or validation_lines(exc.detail)
         st.error(f"{action} was rejected by the API (HTTP 422):", icon=":material/rule:")
-        st.markdown("\n".join(f"- {md_text(line)}" for line in lines) if lines else detail)
+        st.markdown("\n".join(f"- {md_text(line)}" for line in exc.errors) if exc.errors else detail)
         st.caption("Correct the input and submit again.")
     elif exc.status_code == 503:
         clear_health_cache()  # a component changed state: the next run shows fresh readiness
@@ -318,6 +409,103 @@ def show_api_error(exc: Union[ApiUnavailable, ApiError], action: str = "The requ
         st.error(f"{action} failed with HTTP {exc.status_code}: {detail}", icon=":material/error:")
 
 
+# ------------------------------------------------------------------ form pages
+
+
+def seed_form(defaults: Mapping[str, Any]) -> None:
+    """Start every form value at its pre-filled example the first time a page runs in a session."""
+
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def submit_form(
+    request: Dict[str, Any],
+    send: Callable[[Dict[str, Any]], Dict[str, Any]],
+    example: bool,
+    problems: Sequence[str] = (),
+    **extra: Any,
+) -> Dict[str, Any]:
+    """Send a form's request unless reading the form found ``problems``; the outcome keeps the request, the
+    response or API error, when it was sent and whether it came from the unchanged ``example``."""
+
+    outcome: Dict[str, Any] = {
+        "request": request,
+        "problems": list(problems),
+        "response": None,
+        "error": None,
+        "at": time.time(),
+        "example": example,
+        **extra,
+    }
+    if not problems:
+        try:
+            outcome["response"] = send(request)
+        except (ApiUnavailable, ApiError) as exc:
+            outcome["error"] = exc
+    return outcome
+
+
+def render_form_outcome(
+    outcome: Mapping[str, Any],
+    action: str,
+    fields: FieldLabels,
+    render_result: Callable[[Mapping[str, Any]], None],
+    after_error: Optional[Callable[[Union[ApiUnavailable, ApiError]], None]] = None,
+) -> None:
+    """A form's result, or the API's error in the form's words; then the request sent and the raw response."""
+
+    error = outcome.get("error")
+    if error is not None:
+        show_request_error(error, action, fields)
+        if after_error is not None:
+            after_error(error)
+    else:
+        render_result(outcome)
+    json_expander(outcome["request"], "Request sent to the API")
+    if outcome.get("response") is not None:
+        json_expander(outcome["response"])
+
+
+# ------------------------------------------------------------------ radio clips
+
+
+def clip_input(source: str, key_prefix: str) -> Any:
+    """A radio clip from the file uploader (``<key_prefix>_file``) or the browser recorder (``<key_prefix>_recording``)."""
+
+    if source == UPLOAD:
+        return st.file_uploader("Radio clip", type=AUDIO_TYPES, key=f"{key_prefix}_file")
+    return st.audio_input(
+        "Record a clip", key=f"{key_prefix}_recording", help="Browsers allow the microphone only on localhost or HTTPS pages."
+    )
+
+
+def oversize_problem(audio: bytes) -> Optional[str]:
+    """Why a clip is not sent when it is larger than the API accepts; None when it fits."""
+
+    if len(audio) <= MAX_AUDIO_BYTES:
+        return None
+    return (
+        f"The clip is {len(audio) / 2**20:.1f} MiB; the API accepts at most {MAX_AUDIO_TEXT}. Trim it, or save it in "
+        "a compressed format (FLAC, OGG or MP3)."
+    )
+
+
+def transcription_state() -> Dict[str, Any]:
+    """Whisper on the API: ``{"available": True/False/None, "reason": str}`` from /health (None: the check failed)."""
+
+    try:
+        health = cached_health()
+    except (ApiUnavailable, ApiError) as exc:
+        reason = exc.reason if isinstance(exc, ApiUnavailable) else exc.detail
+        return {"available": None, "reason": f"the API status check failed ({reason})"}
+    state = (health.get("modules") or {}).get("emotion_transcription")
+    return {
+        "available": state == "ready",
+        "reason": (health.get("details") or {}).get("emotion_transcription") or "no reason given",
+    }
+
+
 def tied_profiles(scores: Mapping[str, Any]) -> List[str]:
     """The emotion profiles sharing the best acoustic similarity when more than one does, in the API's order."""
 
@@ -329,21 +517,16 @@ def tied_profiles(scores: Mapping[str, Any]) -> List[str]:
 
 
 def profile_tie_note(scores: Mapping[str, Any], acoustic_label: Any) -> Optional[str]:
-    """Markdown warning when the acoustic label won a tie or a near tie: the audio barely supports it over the runner-up."""
+    """Markdown warning when profiles tie for the best similarity (the API then reports neutral), or when the
+    acoustic label leads the runner-up by very little: either way the audio barely separates them."""
 
     tied = tied_profiles(scores)
     label = str(acoustic_label)
     if tied:
         names = f"{', '.join(tied[:-1])} and {tied[-1]}"
-        shared = f"{md_text(names)} {'both' if len(tied) == 2 else 'all'} score {float(scores[tied[0]]):.3f}"
-        if label in tied:  # an API that still reports the first of the tied profiles
-            return (
-                f"**Tied profiles:** {shared}, so the audio does not separate them. The API reports **{md_text(label)}** "
-                "only because it lists that profile first; with no lead over the runner-up, its acoustic confidence "
-                "comes from the similarity alone."
-            )
         return (
-            f"**Tied profiles:** {shared}, so the audio does not separate them: the acoustic label is **neutral** "
+            f"**Tied profiles:** {md_text(names)} {'both' if len(tied) == 2 else 'all'} score "
+            f"{float(scores[tied[0]]):.3f}, so the audio does not separate them: the acoustic label is **neutral** "
             "with confidence 0."
         )
     others = [(float(value), str(name)) for name, value in scores.items() if str(name) != label]
@@ -358,6 +541,98 @@ def profile_tie_note(scores: Mapping[str, Any], acoustic_label: Any) -> Optional
         f"{best - second:.3f} (under {CLOSE_PROFILE_LEAD}), so the audio barely separates them: a slightly different "
         "recording could swap the label. The small lead also keeps the acoustic confidence low."
     )
+
+
+# ------------------------------------------------------------------ regulation passages and declines
+
+
+def decline_explanation(reason: Any) -> Tuple[str, str, str]:
+    """(headline, what happened, what the user can do) for a regulation QA decline_reason."""
+
+    return DECLINE_REASONS.get(
+        reason,
+        ("The API declined to answer", "This UI does not know the reason code; the raw API response has the details.", ""),
+    )
+
+
+def is_definition(passage: Mapping[str, Any]) -> bool:
+    return passage.get("kind") == "definition"
+
+
+def cites_regulation_passage(passages: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether an answer cites a regulation passage: its evidence strength counts only those (definitions have no similarity)."""
+
+    return any(passage.get("cited") and not is_definition(passage) for passage in passages)
+
+
+def pdf_link(passage: Mapping[str, Any]) -> Optional[str]:
+    """The official PDF URL, opened at the passage's PDF page; None unless it is a plain http(s) URL."""
+
+    url = passage.get("source_url")
+    if not isinstance(url, str) or not SAFE_URL.fullmatch(url):
+        return None
+    page = passage.get("page")
+    return f"{url}#page={page}" if isinstance(page, int) else url
+
+
+def location(passage: Mapping[str, Any]) -> str:
+    parts = []
+    if passage.get("section"):
+        parts.append(f"Section {passage['section']}")
+    if passage.get("page_label"):
+        parts.append(f"printed page {passage['page_label']}")
+    if passage.get("page") is not None:
+        parts.append(f"PDF page {passage['page']}")
+    return " · ".join(parts) or "location unknown"
+
+
+def cited_note(grounded: bool) -> str:
+    return "cited" if grounded else "cited by the rejected output"
+
+
+def evidence_label(passage: Mapping[str, Any], grounded: bool) -> str:
+    """A passage's one-line title (Markdown): label, citation, rule or defined term, location and similarity."""
+
+    parts = [str(passage.get("label", "?")), cited_note(grounded) if passage.get("cited") else ""]
+    if is_definition(passage):
+        parts += [f"definition: {passage.get('defined_term') or 'unknown'}", location(passage)]
+    else:
+        parts += [passage.get("nearest_rule") or "", location(passage), f"similarity {score_text(passage.get('score'))}"]
+    return md_text(" · ".join(part for part in parts if part))
+
+
+def render_passage(passage: Mapping[str, Any], grounded: bool = True) -> None:
+    """Badges, location, verbatim text and the official PDF link of one passage given to the answer model.
+
+    A citation of an answer that failed validation (``grounded`` False) is marked as such, not as evidence.
+    """
+
+    badges = []
+    if passage.get("label"):
+        badges.append(f":blue-badge[{md_text(passage['label'])}]")
+    if passage.get("cited"):
+        badges.append(f":{'green' if grounded else 'orange'}-badge[{cited_note(grounded)}]")
+    if is_definition(passage):
+        badges.append(":violet-badge[definition]")
+        details = [f"defined term **{md_text(passage.get('defined_term') or 'unknown')}**", md_text(location(passage))]
+    else:
+        badges.append(":gray-badge[regulation passage]")
+        details = [md_text(location(passage)), f"similarity {score_text(passage.get('score'))}"]
+        if passage.get("nearest_rule"):
+            details.insert(1, f"nearest rule {code_span(passage['nearest_rule'])}")
+    st.markdown(" ".join(badges) + " " + " · ".join(details))
+    if is_definition(passage):
+        st.markdown(
+            "An official definition of a term the passages use or the question names. It is added to the "
+            "evidence, not retrieved by similarity, so its score is not a similarity."
+        )
+    st.markdown("> " + md_text(passage.get("text", "")).replace("\n", "\n> "))
+    link = pdf_link(passage)
+    source = md_text(passage.get("source") or "unknown file")
+    st.caption(f"Source: [{source}, official FIA PDF]({link})" if link else f"Source: {source} (no official URL recorded)")
+
+
+# ------------------------------------------------------------------ regulation index status
 
 
 def uses_compose(base_url: str, settings: Dict[str, Any]) -> bool:
@@ -426,6 +701,55 @@ def rag_fix_steps(fia: Dict[str, Any], compose: bool = False) -> List[str]:
     elif state != "ready" and (index.get("glossary") or {}).get("status") == "missing":
         steps.extend(build("Rebuild the index to add the definitions glossary"))
     return steps
+
+
+def render_rag_problems(fia: Dict[str, Any], compose: bool) -> None:
+    """The API's problem messages for the regulation QA, then the numbered steps that fix its state."""
+
+    for problem in fia.get("problems") or []:
+        st.warning(md_text(problem), icon=":material/report:")
+    steps = rag_fix_steps(fia, compose)
+    if steps:
+        st.markdown("**Next steps** (from the project folder):\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1)))
+
+
+def index_metrics(index: Mapping[str, Any]) -> None:
+    """The regulation index's passage and definition counts (for a row of metrics)."""
+
+    points, expected = index.get("points"), index.get("expected_points")
+    glossary = index.get("glossary") or {}
+    entries = glossary.get("entries")
+    st.metric(
+        "Indexed passages",
+        "–" if points is None else points,
+        help=None if expected is None else f"{expected} expected for the current documents and settings",
+        width="content",
+    )
+    st.metric(
+        "Definitions",
+        humanise(glossary.get("status", "unknown")) if entries is None else entries,
+        help="Official definitions of defined terms, added to the evidence when passages use them",
+        width="content",
+    )
+
+
+def provider_metric(fia: Mapping[str, Any]) -> None:
+    st.metric("Model provider", humanise(fia.get("provider_status", "unknown")), help=PROVIDER_STATUS_HELP, width="content")
+
+
+def refresh_health_once(key: str, stale: bool) -> None:
+    """Rerun once with a fresh /health snapshot when it is ``stale``.
+
+    The sidebar is drawn before the page, from the cached snapshot; when the page's live /api/fia/status shows
+    another regulation QA state, both are brought in step. ``key`` (one per page) stops a rerun loop when the
+    two keep disagreeing.
+    """
+
+    if st.session_state.pop(key, False) or not stale:
+        return
+    clear_health_cache()
+    st.session_state[key] = True
+    st.rerun()
 
 
 def docs_reference(base_url: str, browser_url: Optional[str]) -> str:
@@ -532,7 +856,7 @@ def render_api_sidebar() -> None:
             st.markdown("  \n".join(module_rows(health.get("modules", {}))))
             checked = health_checked_at()
             if checked is not None:
-                st.caption(f"Checked at {time.strftime('%H:%M:%S', time.localtime(checked))}")
+                st.caption(f"Checked at {clock_time(checked)}")
         if st.button("Refresh status", icon=":material/refresh:", key="sidebar_refresh_health"):
             clear_health_cache()
             st.rerun()

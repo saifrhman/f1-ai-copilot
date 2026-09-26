@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from typing import List
 
 import pytest
 from fastapi.testclient import TestClient
-from qdrant_client import QdrantClient
 from streamlit.dataframe_util import convert_arrow_bytes_to_pandas_df
 from streamlit.testing.v1 import AppTest
 
@@ -22,18 +20,21 @@ from app.main import MAX_QUESTION_CHARS, app
 from core_modules.rule_checker.fia_rag import FIARegulationRAG, QdrantConfig, RAGSettings, VectorStoreError
 from core_modules.rule_checker.fia_rag.config import ChunkingConfig, GenerationConfig, RetrievalConfig
 from core_modules.rule_checker.fia_rag.generation import VERIFIER_PROMPT
-from tests.helpers import ScriptedChatModel, fia_page, write_pdf
-from tests.test_fia_evidence_checks import DEFINITIONS, PIT_PENALTY, QUESTION, make_rag
+from core_modules.rule_checker.fia_rag.retrieval import RetrievedPassage
+from tests.helpers import DEFINITIONS_QUESTION, ScriptedChatModel, make_definitions_rag, write_definitions_corpus
 from tests.ui_support import (  # noqa: F401 (pytest fixtures)
     ENTRY_POINT,
     REPO_ROOT,
     assert_no_exception,
+    expander_labels,
+    expanders,
     install_client,
+    markdown_text,
     page_text,
     run_page,
+    sidebar_text,
     ui_api,
     ui_api_down,
-    ui_rag,
 )
 from ui.api_client import ApiClient
 from ui.components import PROVIDER_STATUS_HELP
@@ -68,18 +69,9 @@ DECLINE_CASES = {
 }
 
 
-@pytest.fixture(autouse=True)
-def _no_api_url_from_the_environment(monkeypatch):
-    monkeypatch.delenv("F1_API_URL", raising=False)
-    api_client._shared_client.cache_clear()
-    yield
-    api_client.clear_client_override()
-    api_client._shared_client.cache_clear()
-
-
 @pytest.fixture
-def built_rag(ui_rag):
-    rag, llm = ui_rag
+def built_rag(installed_rag):
+    rag, llm = installed_rag
     rag.build_index()
     return rag, llm
 
@@ -100,26 +92,14 @@ def search(at: AppTest, question: str, top_k: int, min_score: float) -> AppTest:
     return at.run()
 
 
-def expander_labels(block) -> List[str]:
-    """Labels of st.expander blocks (AppTest lists expanders that have an icon under ``status``)."""
-
-    return [str(node.label) for node in [*block.expander, *block.status]]
-
-
 def expander(block, prefix: str):
-    matches = [node for node in [*block.expander, *block.status] if str(node.label).startswith(prefix)]
+    matches = [node for node in expanders(block) if str(node.label).startswith(prefix)]
     assert len(matches) == 1, (prefix, expander_labels(block))
     return matches[0]
 
 
 def texts(block) -> str:
     return "\n".join(str(node.value) for kind in ("markdown", "caption", "code") for node in getattr(block, kind))
-
-
-def markdown_of(block) -> str:
-    """Normal-contrast text only (st.caption excluded)."""
-
-    return "\n".join(str(node.value) for node in block.markdown)
 
 
 def answer_line(at: AppTest) -> str:
@@ -180,7 +160,7 @@ def test_grounded_answer_links_each_citation_to_its_passage(ui_api, built_rag):
     card = at.get_by_key("fia_answer_card")
     assert card.markdown[0].value == ":green-badge[:material/verified: Grounded answer]"  # short: details follow
     assert "The regulations state\\: 80km/h :blue-badge[S1]." in texts(card)
-    assert "Not checked: whether each sentence says what its passage says (the claim verifier is off)." in markdown_of(card)
+    assert "Not checked: whether each sentence says what its passage says (the claim verifier is off)." in markdown_text(card)
     assert body["citations"] == ["S1"] and body["retrieved_passages"][0]["cited"]
     chips = at.get("popover")
     assert [chip.proto.popover.label for chip in chips] == ["S1 · B1.6 · B1"]
@@ -200,7 +180,7 @@ def test_grounded_answer_links_each_citation_to_its_passage(ui_api, built_rag):
     text = page_text(at)
     assert "Evidence strength: 0.644" in text and "Passages cited: 1 of 1" in text
     assert "Evidence strength is the best similarity of the cited regulation passages to the question, not a " in (
-        markdown_of(at)
+        markdown_text(at)
     )
     assert "Retrieval: top_k 3 · threshold 0.200 · passages above it: 1" in text  # the requested depth was sent
     below = expander(at, "Below the threshold (2)")
@@ -214,80 +194,70 @@ def test_grounded_answer_links_each_citation_to_its_passage(ui_api, built_rag):
     assert at.get_by_key("fia_answer_card") and len(llm.calls) == 1
 
 
-def test_definition_passage_is_shown_as_a_definition(ui_api, tmp_path, monkeypatch):
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_PENALTY), fia_page(85, DEFINITIONS)])
+def test_definition_passage_is_shown_as_a_definition(ui_api, tmp_path, monkeypatch, qdrant):
+    folder = write_definitions_corpus(tmp_path / "fia_docs")
     manifest = {"documents": [{"filename": "section_b_sporting.pdf", "section": "B", "source_url": OFFICIAL_URL}]}
     (folder / "manifest.json").write_text(json.dumps(manifest))
     llm = ScriptedChatModel(
         "Speeding in the pit lane during a TTCS gives a drive through penalty [S1][S2]. TTCS include the Race session [S2]."
     )
-    qdrant = QdrantClient(":memory:")
-    rag = make_rag(folder, tmp_path, qdrant, llm=llm)
+    rag = make_definitions_rag(folder, tmp_path, qdrant, llm=llm)
     rag.build_index()
     monkeypatch.setattr(rag_pipeline, "_instance", rag)
-    try:
-        at = ask(run_page("regulations"), QUESTION)
-        assert_no_exception(at)
-        glossary = rag.status()["index"]["glossary"]
-        assert glossary["entries"] >= 3 and f"Definitions: {glossary['entries']}" in page_text(at)
-        assert [chip.proto.popover.label for chip in at.get("popover")] == [
-            "S1 · B1.6 · B1",
-            "S2 · Total Time Classified Session (TTCS) · B85",
-        ]
-        answer = texts(at.get_by_key("fia_answer_card")).split("\n")[1]
-        assert answer == (  # adjacent citations stay two badges
-            "Speeding in the pit lane during a TTCS gives a drive through penalty :blue-badge[S1] :blue-badge[S2]. "
-            "TTCS include the Race session :blue-badge[S2]."
-        )
-        definition = expander(at, "S2 · cited")
-        assert (
-            definition.label
-            == "S2 · cited · definition: Total Time Classified Session (TTCS) · Section B · printed page B85 · PDF page 2"
-        )
-        body = texts(definition)
-        assert ":blue-badge[S2] :green-badge[cited] :violet-badge[definition]" in body
-        assert "defined term **Total Time Classified Session (TTCS)**" in body and "similarity" not in body.split("\n")[0]
-        assert "its score is not a similarity" in body
-        assert f"[section\\_b\\_sporting.pdf, official FIA PDF]({OFFICIAL_URL}#page=2)" in body
-        regulation = texts(expander(at, "S1 · cited"))
-        assert (
-            ":gray-badge[regulation passage] Section B · printed page B1 · PDF page 1 · nearest rule `B1.6` · similarity"
-            in regulation
-        )
-        frame = evidence_frame(at)
-        assert frame["Kind"].tolist() == ["regulation", "definition", "definition"]
-        assert frame["Similarity"].isna().tolist() == [False, True, True]  # a definition score is not a similarity
-        assert frame["Cited"].tolist() == [True, True, False]
-        assert frame["Official PDF"].tolist() == [f"{OFFICIAL_URL}#page=1"] + [f"{OFFICIAL_URL}#page=2"] * 2
-        assert frame["Section"].tolist() == ["B"] * 3 and frame["Printed page"].tolist() == ["B1", "B85", "B85"]
-        assert frame["PDF page"].tolist() == [1, 2, 2]
+    at = ask(run_page("regulations"), DEFINITIONS_QUESTION)
+    assert_no_exception(at)
+    glossary = rag.status()["index"]["glossary"]
+    assert glossary["entries"] >= 3 and f"Definitions: {glossary['entries']}" in page_text(at)
+    assert [chip.proto.popover.label for chip in at.get("popover")] == [
+        "S1 · B1.6 · B1",
+        "S2 · Total Time Classified Session (TTCS) · B85",
+    ]
+    answer = texts(at.get_by_key("fia_answer_card")).split("\n")[1]
+    assert answer == (  # adjacent citations stay two badges
+        "Speeding in the pit lane during a TTCS gives a drive through penalty :blue-badge[S1] :blue-badge[S2]. "
+        "TTCS include the Race session :blue-badge[S2]."
+    )
+    definition = expander(at, "S2 · cited")
+    assert (
+        definition.label
+        == "S2 · cited · definition\\: Total Time Classified Session (TTCS) · Section B · printed page B85 · PDF page 2"
+    )
+    body = texts(definition)
+    assert ":blue-badge[S2] :green-badge[cited] :violet-badge[definition]" in body
+    assert "defined term **Total Time Classified Session (TTCS)**" in body and "similarity" not in body.split("\n")[0]
+    assert "its score is not a similarity" in body
+    assert f"[section\\_b\\_sporting.pdf, official FIA PDF]({OFFICIAL_URL}#page=2)" in body
+    regulation = texts(expander(at, "S1 · cited"))
+    assert (
+        ":gray-badge[regulation passage] Section B · printed page B1 · PDF page 1 · nearest rule `B1.6` · similarity"
+        in regulation
+    )
+    frame = evidence_frame(at)
+    assert frame["Kind"].tolist() == ["regulation", "definition", "definition"]
+    assert frame["Similarity"].isna().tolist() == [False, True, True]  # a definition score is not a similarity
+    assert frame["Cited"].tolist() == [True, True, False]
+    assert frame["Official PDF"].tolist() == [f"{OFFICIAL_URL}#page=1"] + [f"{OFFICIAL_URL}#page=2"] * 2
+    assert frame["Section"].tolist() == ["B"] * 3 and frame["Printed page"].tolist() == ["B1", "B85", "B85"]
+    assert frame["PDF page"].tolist() == [1, 2, 2]
 
-        at = search(at, QUESTION, top_k=1, min_score=0.1)  # the API default threshold of this pipeline
-        assert_no_exception(at)
-        assert "Definitions added: 2" in page_text(at) and "Definitions Ask would add (2)" in page_text(at)
-        assert expander(at, "Total Time Classified Session (TTCS) · Section B")
-    finally:
-        qdrant.close()
+    at = search(at, DEFINITIONS_QUESTION, top_k=1, min_score=0.1)  # the API default threshold of this pipeline
+    assert_no_exception(at)
+    assert "Definitions added: 2" in page_text(at) and "Definitions Ask would add (2)" in page_text(at)
+    assert expander(at, "Total Time Classified Session (TTCS) · Section B")
 
 
-def test_an_answer_citing_only_definitions_has_no_evidence_strength(ui_api, tmp_path, monkeypatch):
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_PENALTY), fia_page(85, DEFINITIONS)])
-    qdrant = QdrantClient(":memory:")
-    rag = make_rag(folder, tmp_path, qdrant, llm=ScriptedChatModel("TTCS include the Race session [S2]."))
+def test_an_answer_citing_only_definitions_has_no_evidence_strength(ui_api, tmp_path, monkeypatch, qdrant):
+    folder = write_definitions_corpus(tmp_path / "fia_docs")
+    rag = make_definitions_rag(folder, tmp_path, qdrant, llm=ScriptedChatModel("TTCS include the Race session [S2]."))
     rag.build_index()
     monkeypatch.setattr(rag_pipeline, "_instance", rag)
-    try:
-        body = api_client.get_client().fia_query(QUESTION)
-        assert body["grounded"] and body["confidence"] == 0.0 and body["top_retrieval_score"] > 0.5
-        at = ask(run_page("regulations"), QUESTION)
-        assert_no_exception(at)
-        text = page_text(at)
-        assert "Evidence strength: –" in text and "Evidence strength: 0.000" not in text
-        assert "Only official definitions were cited. Definitions are not retrieved by similarity" in markdown_of(at)
-    finally:
-        qdrant.close()
+    body = api_client.get_client().fia_query(DEFINITIONS_QUESTION)
+    assert body["grounded"] and body["confidence"] == 0.0 and body["top_retrieval_score"] > 0.5
+    at = ask(run_page("regulations"), DEFINITIONS_QUESTION)
+    assert_no_exception(at)
+    text = page_text(at)
+    assert "Evidence strength: –" in text and "Evidence strength: 0.000" not in text
+    assert "Only official definitions were cited. Definitions are not retrieved by similarity" in markdown_text(at)
 
 
 def test_evidence_strength_is_the_cited_passage_score_not_the_top_retrieval_score(ui_api, built_rag, monkeypatch):
@@ -321,7 +291,7 @@ def test_a_verified_answer_says_what_the_claim_verifier_judged(ui_api, built_rag
     at = ask(at, PIT_QUESTION)
     assert_no_exception(at)
     assert len(llm.calls) == 2
-    note = markdown_of(at.get_by_key("fia_answer_card"))
+    note = markdown_text(at.get_by_key("fia_answer_card"))
     assert "The claim verifier (a second model call) also judged every sentence supported" in note
     assert "a model's judgement, not proof" in note and "Not checked" not in note
     assert "**Claim verification:** verified · 1 sentences checked" in texts(expander(at, "Validation details"))
@@ -336,6 +306,10 @@ def test_a_verified_answer_says_what_the_claim_verifier_judged(ui_api, built_rag
         ("The pit lane limit is 80km/h【S1】.", "The pit lane limit is 80km/h :blue-badge[S1]."),
         ("The pit lane limit is 80km/h [Source 1].", "The pit lane limit is 80km/h :blue-badge[S1]."),
         ("The pit lane limit is 80km/h, as source S1 states.", "The pit lane limit is 80km/h, as source :blue-badge[S1] states."),
+        # full-width and superscript forms the API folds to [S1] / (source S1)
+        ("The pit lane limit is 80km/h［Ｓ１］.", "The pit lane limit is 80km/h :blue-badge[S1]."),
+        ("The pit lane limit is 80km/h [S¹].", "The pit lane limit is 80km/h :blue-badge[S1]."),
+        ("The pit lane limit is 80km/h (ｓｏｕｒｃｅ S1).", "The pit lane limit is 80km/h :blue-badge[S1]."),
     ],
 )
 def test_every_citation_style_the_api_accepts_is_shown_as_its_label(ui_api, built_rag, reply, shown):
@@ -345,6 +319,15 @@ def test_every_citation_style_the_api_accepts_is_shown_as_its_label(ui_api, buil
     assert_no_exception(at)
     assert answer_line(at) == shown
     assert [chip.proto.popover.label for chip in at.get("popover")] == ["S1 · B1.6 · B1"]
+
+
+def test_a_range_citation_is_shown_as_the_labels_it_names(ui_api, built_rag, monkeypatch):
+    rag, llm = built_rag
+    with_retrieval(rag, monkeypatch, top_k=4, min_score=0.05)  # two passages clear it
+    llm.reply = "The pit lane and pit stop releases are both regulated [S1-S2]."
+    at = ask(run_page("regulations"), PIT_QUESTION)
+    assert_no_exception(at)
+    assert answer_line(at) == "The pit lane and pit stop releases are both regulated :blue-badge[S1, S2]."
 
 
 def test_bold_and_italics_of_an_answer_render_but_links_and_directives_do_not(ui_api, built_rag):
@@ -413,7 +396,7 @@ def test_every_decline_reason_is_explained(ui_api, built_rag, monkeypatch, reaso
     assert_no_exception(at)
     card = texts(at.get_by_key("fia_decline_card"))
     assert f"**{headline}**" in card and f"Reason code `{reason}`" in card
-    assert "**What you can do:** " in markdown_of(at.get_by_key("fia_decline_card"))  # not in a faint caption
+    assert "**What you can do:** " in markdown_text(at.get_by_key("fia_decline_card"))  # not in a faint caption
     assert ("FIA_RAG_MAX_OUTPUT_TOKENS" in card) == (reason == "truncated_model_output")
     if reason == "empty_model_output":
         with pytest.raises(KeyError):
@@ -421,7 +404,7 @@ def test_every_decline_reason_is_explained(ui_api, built_rag, monkeypatch, reaso
     else:
         rejected = at.get_by_key("fia_rejected_output")
         assert rejected.proto.expanded is False and rejected.code[0].value
-        assert "It is not a statement of the regulations." in markdown_of(rejected)
+        assert "It is not a statement of the regulations." in markdown_text(rejected)
     details = texts(expander(at, "Validation details"))
     if reason == "unverified_claim":
         assert "**Claim verification:** unverified · 1 sentences checked · unsupported sentence numbers: \\[1\\]" in details
@@ -439,7 +422,16 @@ def test_a_reply_stopped_by_the_content_filter_is_not_blamed_on_the_output_limit
     assert "**The answer was cut off**" in card and "Reason code `truncated_model_output`" in card
     assert "The provider's content filter stopped the model's reply" in card
     assert "a higher output limit does not" in card and "FIA_RAG_MAX_OUTPUT_TOKENS" not in card and "output limit and" not in card
-    assert at.get_by_key("fia_rejected_output").code[0].value.startswith("[finish_reason=content_filter]")
+    assert at.get_by_key("fia_rejected_output").code[0].value == GOOD_ANSWER  # the model's text as it was
+
+
+def test_a_reply_stopped_at_max_tokens_is_explained_as_the_output_limit(ui_api, built_rag):
+    _, llm = built_rag
+    llm.reply, llm.finish_reason = GOOD_ANSWER, "max_tokens"  # some providers' name for "length"
+    at = ask(run_page("regulations"), PIT_QUESTION)
+    assert_no_exception(at)
+    card = texts(at.get_by_key("fia_decline_card"))
+    assert "The model's reply reached its output limit" in card and "raise `FIA_RAG_MAX_OUTPUT_TOKENS`" in card
 
 
 def test_the_covered_decline_reasons_are_the_documented_ones(ui_api):
@@ -463,7 +455,7 @@ def test_search_shows_scores_and_the_threshold_split_without_the_answer_model(ui
     text = page_text(at)
     assert "Best similarity: 0.644" in text and "Above the threshold: 1" in text and "Below the threshold: 2" in text
     assert "top_k 3, threshold 0.300" in text
-    assert "No answer model was called: these are search results, not an answer." in markdown_of(at)
+    assert "No answer model was called: these are search results, not an answer." in markdown_text(at)
 
     chart = at.get("vega_lite_chart")[0]
     spec = json.loads(chart.proto.spec)
@@ -493,6 +485,30 @@ def test_search_shows_scores_and_the_threshold_split_without_the_answer_model(ui
     assert scale["domain"] == ["Above the threshold"] and len(scale["range"]) == 1  # no legend entry for an empty group
 
 
+def test_passage_titles_from_the_pdfs_are_shown_literally_on_both_tabs(ui_api, built_rag, monkeypatch):
+    rag, llm = built_rag
+    real = rag.retrieve
+    definition = RetrievedPassage(
+        "definition:B:x", "A marked-up term.", 0.0, "b.pdf", 2, kind="definition", defined_term="*Pit* [lane]"
+    )
+
+    def marked_up(*args, **kwargs):  # rule headings and defined terms are PDF text, never Markdown
+        result = real(*args, **kwargs)
+        return replace(
+            result, passages=[replace(p, nearest_rule="B1.6 *x* [y]") for p in result.passages], definitions=[definition]
+        )
+
+    monkeypatch.setattr(rag, "retrieve", marked_up)
+    at = search(run_page("regulations"), PIT_QUESTION, top_k=1, min_score=0.3)
+    assert_no_exception(at)
+    assert expander(at, "#1 · B1.6 \\*x\\* \\[y\\] · B1 · similarity")
+    assert expander(at, "\\*Pit\\* \\[lane\\] · PDF page 2")
+    llm.reply = GOOD_ANSWER
+    at = ask(at, PIT_QUESTION)
+    assert_no_exception(at)
+    assert [chip.proto.popover.label for chip in at.get("popover")] == ["S1 · B1.6 \\*x\\* \\[y\\] · B1"]
+
+
 def test_search_says_what_ask_would_do_only_at_the_api_default_threshold(ui_api, built_rag):
     at = run_page("regulations")
     assert at.slider(key="fia_search_min_score").help.startswith("For this search only: Ask always uses the API default, 0.200")
@@ -501,7 +517,7 @@ def test_search_says_what_ask_would_do_only_at_the_api_default_threshold(ui_api,
     assert_no_exception(at)
     text = page_text(at)
     assert "Above the threshold: 0" in text and "None at this threshold." in text and "Ask would decline" not in text
-    assert "Ask always uses the API default threshold (0.200); this threshold is for exploring" in markdown_of(at)
+    assert "Ask always uses the API default threshold (0.200); this threshold is for exploring" in markdown_text(at)
     assert expander(at, "Below the threshold (4)").label.endswith("retrieved, not evidence at this threshold")
     help_text = {metric.label: metric.proto.help for metric in at.metric}["Above the threshold"]
     assert "answer model" not in help_text
@@ -535,7 +551,7 @@ def test_unconfigured_rag_shows_the_reason_and_the_fix_and_locks_the_forms(ui_ap
     assert not at.button(key="fia_refresh_status").disabled
 
 
-def test_an_index_that_is_not_built_locks_the_forms(ui_api, ui_rag):
+def test_an_index_that_is_not_built_locks_the_forms(ui_api, installed_rag):
     at = run_page("regulations")  # the documents and models are there, the index is not
     assert_no_exception(at)
     text = page_text(at)
@@ -666,20 +682,20 @@ def test_a_failing_provider_keeps_the_forms_usable_and_the_sidebar_in_step(ui_ap
     assert_no_exception(at)
     assert "provider unreachable" in service_unavailable(at)
     assert "The model provider call failed" in page_text(at)
-    sidebar = "\n".join(str(node.value) for node in at.sidebar.markdown)
+    sidebar = sidebar_text(at)
     assert ":red-badge[provider failing] FIA regulation QA" in sidebar
     assert ":red-badge[provider failing] **Regulation index**" in page_text(at) and "Model provider: failing" in page_text(at)
     assert not at.button(key="fia_ask_submit").disabled  # a retry can succeed
     assert (
         "Submitting again calls the model provider again (with its automatic retries); the state clears after a "
         "successful request."
-    ) in markdown_of(at)
+    ) in markdown_text(at)
 
     broken[0] = False
     at.button(key="fia_ask_submit").click().run()
     assert_no_exception(at)
     assert at.get_by_key("fia_answer_card")
-    sidebar = "\n".join(str(node.value) for node in at.sidebar.markdown)
+    sidebar = sidebar_text(at)
     assert ":green-badge[ready] FIA regulation QA" in sidebar and "provider failing" not in sidebar
 
 

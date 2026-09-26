@@ -8,18 +8,12 @@ import json
 
 import pytest
 from langchain_core.documents import Document
-from qdrant_client import QdrantClient
 
 import core_modules.rule_checker.fia_rag.pipeline as rag_pipeline
 from core_modules.rule_checker.fia_rag import (
-    ChunkingConfig,
-    EmbeddingConfig,
-    FIARegulationRAG,
     IndexNotReadyError,
-    QdrantConfig,
     RAGConfigurationError,
     RAGSettings,
-    RetrievalConfig,
     RetrievedPassage,
 )
 from core_modules.rule_checker.fia_rag.config import GenerationConfig
@@ -39,21 +33,13 @@ from core_modules.rule_checker.fia_rag.glossary import (
     with_frequencies,
 )
 from core_modules.rule_checker.fia_rag.grounding import DeclineReason, label_passages, validate_answer
-from tests.helpers import HashingEmbeddings, ScriptedChatModel, fia_page, write_pdf
-
-PIT_PENALTY = (
-    "B1.6 Pit Lane Speed\nB1.6.4 Speeding in the pit lane during a TTCS will be penalised with a drive through "
-    "penalty. Speeding in the pit lane during an LTCS will be penalised with a fine."
-)
-DEFINITIONS = (
-    "APPENDIX B1 DEFINITIONS\n"
-    "“Total Time Classified Session” (or “TTCS”) is any track running session during which the "
-    "classification is determined by the total time taken. Total Time Classified Sessions include the Sprint "
-    "session and the Race session.\n"
-    "“Lap Time Classified Session” (or “LTCS”) is any session classified by the fastest lap "
-    "time of each driver, such as Qualifying.\n"
-    "“Official” means any of the persons listed in the Code.\n"
-    "“Cost Cap” has the meaning set out in Article D4.1.2."
+from tests.helpers import (
+    DEFINITIONS,
+    DEFINITIONS_QUESTION,
+    HashingEmbeddings,
+    ScriptedChatModel,
+    make_definitions_rag,
+    write_definitions_corpus,
 )
 
 
@@ -164,38 +150,14 @@ def test_question_terms_come_first_limit_and_known_definitions():
 
 @pytest.fixture
 def docs(tmp_path):
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_PENALTY), fia_page(85, DEFINITIONS)])
-    return folder
-
-
-@pytest.fixture
-def qdrant():
-    client = QdrantClient(":memory:")
-    yield client
-    client.close()
-
-
-def make_rag(docs, tmp_path, qdrant, llm=None, embeddings=None, max_definitions=3, verify=False):
-    settings = RAGSettings(
-        docs_path=docs,
-        chunking=ChunkingConfig(chunk_size=400, chunk_overlap=0),
-        embedding=EmbeddingConfig(model="hashing-test-512"),
-        retrieval=RetrievalConfig(top_k=1, min_score=0.1, max_definitions=max_definitions),
-        generation=GenerationConfig(verify_claims=verify),
-        qdrant=QdrantConfig(collection="fia_test", path=tmp_path / "qdrant"),
-    )
-    return FIARegulationRAG(settings, embeddings=embeddings or HashingEmbeddings(), llm=llm, qdrant_client=qdrant)
-
-
-QUESTION = "What happens when speeding in the pit lane?"
+    return write_definitions_corpus(tmp_path / "fia_docs")
 
 
 def test_index_build_stores_the_glossary_and_retrieval_adds_definitions(docs, tmp_path, qdrant):
-    rag = make_rag(docs, tmp_path, qdrant)
+    rag = make_definitions_rag(docs, tmp_path, qdrant)
     report = rag.build_index()
     assert report.status == "rebuilt" and report.definitions >= 3
-    result = rag.retrieve(QUESTION)
+    result = rag.retrieve(DEFINITIONS_QUESTION)
     assert len(result.passages) == 1 and "B1.6.4" in result.passages[0].rule_ids
     assert [(d.kind, d.defined_term, d.page_label, d.score) for d in result.definitions] == [
         ("definition", "Total Time Classified Session (TTCS)", "B85", 0.0),
@@ -208,36 +170,36 @@ def test_index_build_stores_the_glossary_and_retrieval_adds_definitions(docs, tm
 
 
 def test_glossary_is_reloaded_from_qdrant_by_a_new_process(docs, tmp_path, qdrant):
-    make_rag(docs, tmp_path, qdrant).build_index()
-    fresh = make_rag(docs, tmp_path, qdrant)
-    assert [d.defined_term for d in fresh.retrieve(QUESTION).definitions][0] == "Total Time Classified Session (TTCS)"
+    make_definitions_rag(docs, tmp_path, qdrant).build_index()
+    fresh = make_definitions_rag(docs, tmp_path, qdrant)
+    assert fresh.retrieve(DEFINITIONS_QUESTION).definitions[0].defined_term == "Total Time Classified Session (TTCS)"
 
 
 def test_missing_glossary_blocks_queries_until_rebuilt_without_embedding_calls(docs, tmp_path, qdrant):
     embeddings = HashingEmbeddings()
-    rag = make_rag(docs, tmp_path, qdrant, embeddings=embeddings)
+    rag = make_definitions_rag(docs, tmp_path, qdrant, embeddings=embeddings)
     rag.build_index()
     qdrant.delete_collection(rag.index().alias_target("fia_test_glossary"))
-    fresh = make_rag(docs, tmp_path, qdrant, embeddings=embeddings)
+    fresh = make_definitions_rag(docs, tmp_path, qdrant, embeddings=embeddings)
     status = fresh.status()
     assert not status["ready"] and status["index"]["glossary"]["status"] == "missing"
     assert any("glossary" in problem for problem in status["problems"])
     with pytest.raises(IndexNotReadyError, match="glossary"):
-        fresh.retrieve(QUESTION)
+        fresh.retrieve(DEFINITIONS_QUESTION)
     # With definitions disabled the index is usable without a glossary.
-    assert make_rag(docs, tmp_path, qdrant, embeddings=embeddings, max_definitions=0).retrieve(QUESTION).definitions == []
+    assert make_definitions_rag(docs, tmp_path, qdrant, embeddings=embeddings, max_definitions=0).retrieve(DEFINITIONS_QUESTION).definitions == []
     embedded_before = embeddings.documents_embedded
     report = fresh.build_index()
     assert report.status == "glossary_rebuilt" and embeddings.documents_embedded == embedded_before
-    assert fresh.retrieve(QUESTION).definitions
+    assert fresh.retrieve(DEFINITIONS_QUESTION).definitions
     assert fresh.build_index().status == "up_to_date"
 
 
 def test_glossary_from_an_older_extractor_version_is_not_used(docs, tmp_path, qdrant, monkeypatch):
-    make_rag(docs, tmp_path, qdrant).build_index()
+    make_definitions_rag(docs, tmp_path, qdrant).build_index()
     monkeypatch.setattr(rag_pipeline, "GLOSSARY_VERSION", "999")
     with pytest.raises(IndexNotReadyError, match="glossary"):
-        make_rag(docs, tmp_path, qdrant).retrieve(QUESTION)
+        make_definitions_rag(docs, tmp_path, qdrant).retrieve(DEFINITIONS_QUESTION)
 
 
 def test_definitions_are_labelled_after_passages_and_do_not_raise_confidence(docs, tmp_path, qdrant):
@@ -245,9 +207,9 @@ def test_definitions_are_labelled_after_passages_and_do_not_raise_confidence(doc
         "Speeding in the pit lane during a TTCS is penalised with a drive through penalty [S1], "
         "and TTCS include the Race session [S2]."
     )
-    rag = make_rag(docs, tmp_path, qdrant, llm=llm)
+    rag = make_definitions_rag(docs, tmp_path, qdrant, llm=llm)
     rag.build_index()
-    result = rag.answer(QUESTION)
+    result = rag.answer(DEFINITIONS_QUESTION)
     assert result["grounded"], result["validation"]
     prompt = llm.last_prompt
     assert 'label="S2"' in prompt and 'kind="definition"' in prompt and 'defined_term="Total Time Classified Session (TTCS)"' in prompt
@@ -257,10 +219,25 @@ def test_definitions_are_labelled_after_passages_and_do_not_raise_confidence(doc
     assert result["retrieval"]["definitions_added"] == 2
 
 
-def test_answer_citing_only_definitions_has_zero_evidence_score(docs, tmp_path, qdrant):
-    rag = make_rag(docs, tmp_path, qdrant, llm=ScriptedChatModel("TTCS include the Race session [S2]."))
+def test_answer_uses_the_retrieved_definitions_and_a_re_split_retrieval_derives_them_again(docs, tmp_path, qdrant, monkeypatch):
+    rag = make_definitions_rag(docs, tmp_path, qdrant, llm=ScriptedChatModel("TTCS include the Race session [S2]."))
     rag.build_index()
-    result = rag.answer(QUESTION)
+    derived = []
+    original = rag_pipeline.definitions_for
+    monkeypatch.setattr(rag_pipeline, "definitions_for", lambda *args: derived.append(args) or original(*args))
+    assert rag.answer(DEFINITIONS_QUESTION)["retrieval"]["definitions_added"] == 2
+    assert len(derived) == 1  # by retrieve; the answer uses them as they are
+    # with_threshold drops the definitions (the evaluation script re-splits retrievals), so they are derived again.
+    resplit = rag.retrieve(DEFINITIONS_QUESTION).with_threshold(0.1)
+    assert resplit.definitions == []
+    result = rag.answer_from_retrieval(resplit)
+    assert result["grounded"] and result["retrieval"]["definitions_added"] == 2
+
+
+def test_answer_citing_only_definitions_has_zero_evidence_score(docs, tmp_path, qdrant):
+    rag = make_definitions_rag(docs, tmp_path, qdrant, llm=ScriptedChatModel("TTCS include the Race session [S2]."))
+    rag.build_index()
+    result = rag.answer(DEFINITIONS_QUESTION)
     assert result["grounded"] and result["confidence"] == 0.0
 
 
@@ -275,7 +252,12 @@ def test_definitions_alone_are_never_evidence():
 
 PIT = RetrievedPassage("c1", "a. A speed limit of 80km/h will be imposed. The fine is 100 EUR.", 0.8, "b.pdf", 10, nearest_rule="12.4")
 FUEL = RetrievedPassage("c2", "The fuel mass flow must not exceed one hundred kilograms per hour. The cap is USD 135,000,000 and the ratio 0.30.", 0.7, "c.pdf", 5)
-EVIDENCE = label_passages([PIT, FUEL])
+# On PDF page 9, printed page B9, of a real file name (2026, 08, 05, 7); the text itself states no number.
+SPORTING = RetrievedPassage(
+    "c3", "B1.6.4 Speeding in the pit lane is penalised with a drive through penalty.", 0.7,
+    "fia_2026_f1_regulations_-_section_b_sporting_-_iss_08_-_2026-08-05_7.pdf", 9, page_label="B9", nearest_rule="B1.6",
+)
+EVIDENCE = label_passages([PIT, FUEL, SPORTING])
 
 
 @pytest.mark.parametrize(
@@ -288,6 +270,11 @@ EVIDENCE = label_passages([PIT, FUEL])
         "1. The pit lane limit is 80km/h [S1].\n2. The fine is 100 EUR [S1].",  # list markers
         "Under Article 12.4 the limit is 80km/h [S1].",  # numeric rule id supported by metadata
         "The limit is 80km/h [S1].\n\nTherefore a car at 95km/h is 15km/h too fast.",  # marked inference
+        # references to where the cited passage is
+        "Speeding is penalised with a drive through penalty (page 9) [S3].",
+        "Speeding is penalised with a drive through penalty (PDF page 9, printed page B9, Issue 08) [S3].",
+        f"Speeding is penalised with a drive through penalty ({SPORTING.source}) [S3].",
+        "The 2026 Sporting Regulations penalise speeding with a drive through penalty [S3].",
     ],
 )
 def test_numbers_stated_by_the_evidence_are_accepted(answer):
@@ -303,6 +290,23 @@ def test_numbers_stated_by_the_evidence_are_accepted(answer):
         ("The cap is US$145 million [S2].", "145"),
         ("The pit lane limit is 80km/h [S2].", "80"),  # stated by S1, but only S2 is cited
         ("The limit is 80km/h for 3 laps [S1].", "3"),
+        ("The limit is 80km/h for 10 laps [S1].", "10"),  # S1 is on page 10, but its text does not say 10
+        # only the identifier itself is exempt, not every other 12 in the answer
+        ("Article 12 sets the limit of 80km/h and adds a 12 place grid penalty [S1].", "12"),
+        # a passage's metadata (page, issue, file-name date and suffix) is not evidence
+        ("Speeding is penalised with a drive through penalty (page 99) [S3].", "99"),
+        ("The 2027 Sporting Regulations penalise speeding with a drive through penalty [S3].", "2027"),
+        ("Speeding is penalised with a drive through penalty plus a 5-place grid drop [S3].", "5"),
+        ("Speeding is penalised with a 7 second Stop-and-Go Penalty [S3].", "7"),
+        ("Speeding costs 8 championship points [S3].", "8"),
+        # each reference is compared with its own kind of metadata: 8 is the issue, not the page; 9 the page
+        ("Speeding is penalised with a drive through penalty (page 8) [S3].", "8"),
+        ("Speeding is penalised with a drive through penalty (Issue 9) [S3].", "9"),
+        # the verb "issue" is no document reference, whatever number follows it
+        ("The stewards may issue 5 penalty points for speeding in the pit lane [S3].", "5"),
+        ("The stewards may issue 8 penalty points for speeding in the pit lane [S3].", "8"),
+        # a rule identifier split after a dot does not swallow the number of the next sentence
+        ("Speeding is penalised with a drive through penalty under Article B1.6. 4 penalty points are also given [S3].", "4"),
     ],
 )
 def test_numbers_missing_from_the_cited_evidence_are_declined(answer, number):
@@ -388,9 +392,9 @@ def test_answer_sentences_keep_their_citations():
 
 def test_pipeline_reports_claim_verification(docs, tmp_path, qdrant):
     answer = "Speeding in the pit lane during a TTCS is penalised with a drive through penalty [S1]."
-    rag = make_rag(docs, tmp_path, qdrant, llm=scripted('{"unsupported": []}', answer=answer), verify=True)
+    rag = make_definitions_rag(docs, tmp_path, qdrant, llm=scripted('{"unsupported": []}', answer=answer), verify=True)
     rag.build_index()
-    result = rag.answer(QUESTION)
+    result = rag.answer(DEFINITIONS_QUESTION)
     assert result["grounded"] and result["validation"]["claim_verification"]["status"] == "verified"
 
 
@@ -416,8 +420,8 @@ def test_invalid_definition_and_verifier_settings_are_rejected(env):
 
 
 def test_verifier_output_is_json_serialisable(docs, tmp_path, qdrant):
-    rag = make_rag(docs, tmp_path, qdrant, llm=scripted('{"unsupported": [1]}', answer="Speeding in the pit lane during a TTCS is penalised [S1]."), verify=True)
+    rag = make_definitions_rag(docs, tmp_path, qdrant, llm=scripted('{"unsupported": [1]}', answer="Speeding in the pit lane during a TTCS is penalised [S1]."), verify=True)
     rag.build_index()
-    result = rag.answer(QUESTION)
+    result = rag.answer(DEFINITIONS_QUESTION)
     assert result["decline_reason"] == DeclineReason.UNVERIFIED_CLAIM
     json.dumps(result)

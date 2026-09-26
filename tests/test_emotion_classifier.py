@@ -18,6 +18,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from typing import get_args
 
 import numpy as np
 import pytest
@@ -35,7 +36,7 @@ from core_modules.driver_emotion.emotion_classifier import (
     classify_text_emotion,
     combine_evidence,
 )
-from core_modules.driver_emotion.schemas import AudioFeatures, EmotionRequest, EmotionResponse
+from core_modules.driver_emotion.schemas import AudioFeatures, EmotionRequest, EmotionResponse, EvidenceCombination
 
 EMOTION_VALUES = {emotion.value for emotion in EmotionType}
 
@@ -64,16 +65,14 @@ def speech_like(sr, seconds=1.5, f0=160.0, amplitude=0.3, snr_db=None, seed=0, c
     return np.clip(y, -1.0, 1.0)
 
 
-def encode(y, sr, fmt="WAV"):
+def wav_bytes(y, sr, fmt="WAV"):
     buffer = io.BytesIO()
     sf.write(buffer, y, sr, format=fmt)
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def wav_bytes(y, sr):
-    buffer = io.BytesIO()
-    sf.write(buffer, y, sr, format="WAV")
     return buffer.getvalue()
+
+
+def encode(y, sr, fmt="WAV"):
+    return base64.b64encode(wav_bytes(y, sr, fmt)).decode("ascii")
 
 
 def assert_finite_features(result):
@@ -90,6 +89,9 @@ def assert_finite_features(result):
     assert voiced_of_clip == pytest.approx(voiced_of_non_silent * non_silent_of_clip)
     assert result["emotion"] in EMOTION_VALUES
     assert 0.0 <= result["confidence"] <= 0.95
+    # How both confidences were computed, so clients need no copy of the formulas.
+    assert result["acoustic_confidence_rule"] == ec.ACOUSTIC_CONFIDENCE_RULE
+    assert result["evidence_combination_rule"] == ec.EVIDENCE_COMBINATION_RULES[result["evidence_combination"]]
     EmotionResponse.model_validate(result)  # documented response contract, extra keys forbidden
     json.dumps(result, allow_nan=False)
 
@@ -97,8 +99,6 @@ def assert_finite_features(result):
 @pytest.fixture(autouse=True)
 def _fresh_transcriber(monkeypatch):
     monkeypatch.setattr(ec, "_transcriber", None)
-    monkeypatch.delenv("WHISPER_MODEL", raising=False)
-    monkeypatch.delenv("WHISPER_CACHE_DIR", raising=False)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -387,9 +387,6 @@ def test_local_paths_work_only_when_explicitly_allowed(tmp_path):
     result = classify_emotion_detailed(str(path), allow_local_paths=True)
     assert_finite_features(result)
     assert result["audio_features"]["mean_pitch"] == pytest.approx(150.0, rel=0.05)
-    assert ec.classify_emotion(str(path), allow_local_paths=True) in EMOTION_VALUES
-    with pytest.raises(ValueError):
-        ec.classify_emotion(str(path))
 
     for unusable in (tmp_path / "missing.wav", tmp_path):
         with pytest.raises(ValueError, match="existing audio file path"):
@@ -937,9 +934,8 @@ def test_unreadable_model_file_is_not_blamed_on_the_network(monkeypatch, tmp_pat
     monkeypatch.setenv("WHISPER_CACHE_DIR", str(models))
     monkeypatch.setenv("WHISPER_MODEL", "tiny")
 
-    with _permissions(checkpoint, 0o000, os.R_OK):
-        with pytest.raises(TranscriptionError) as error:
-            classify_emotion_detailed(encode(speech_like(22050), 22050), transcribe=True)
+    with _permissions(checkpoint, 0o000, os.R_OK), pytest.raises(TranscriptionError) as error:
+        classify_emotion_detailed(encode(speech_like(22050), 22050), transcribe=True)
     message = str(error.value)
     assert message.startswith("Loading the Whisper model 'tiny' failed (PermissionError); Whisper could not create, read")
     assert "check that directory's permissions" in message
@@ -998,7 +994,7 @@ def test_check_whisper_script_prints_transcript_timing_and_full_result(monkeypat
     assert "Whisper model:   tiny\n" in out
     assert f"Model cache dir: {tmp_path / 'models'}\n" in out
     for timing in ("Model load", "Transcription", "Acoustic only", "Full analysis"):
-        assert re.search(rf"^{timing}: +\d+\.\d\d s", out, re.M), timing
+        assert re.search(rf"^{timing}: +\d+\.\d\d s", out, re.MULTILINE), timing
     # The model is loaded inside the timed "Model load" step (not during the transcription), and
     # only once: the transcription and the full analysis reuse it.
     assert out.count("fake whisper: loading model 'tiny'") == 1
@@ -1209,7 +1205,6 @@ def test_emotion_request_transcribe_booleans_round_trip():
 
 def test_rejected_non_audio_does_not_leak_file_handles(tmp_path):
     import gc
-    import warnings
 
     from core_modules.driver_emotion.emotion_classifier import load_waveform
 
@@ -1237,6 +1232,15 @@ def test_an_exact_tie_for_the_best_profile_is_neutral_not_the_first_listed():
     assert emotion is ec.EmotionType.CALM and confidence == pytest.approx(0.4555, abs=1e-3)
 
 
-def test_disclaimer_states_how_the_acoustic_confidence_is_computed():
-    assert "0.45 x the best profile similarity + 0.55 x its lead over the runner-up" in ec.DISCLAIMER
-    assert "not a probability" in ec.DISCLAIMER
+def test_the_rule_texts_state_the_formulas_the_classifier_uses():
+    assert ec.ACOUSTIC_CONFIDENCE_RULE.startswith(
+        "0.45 × the best profile similarity + 0.55 × its lead over the runner-up, at most 0.95; below 0.20"
+    )
+    assert "confidence = min(0.95, max(acoustic, text) + 0.10)" in ec.EVIDENCE_COMBINATION_RULES["text_agrees"]
+    assert "at least 2 more hits" in ec.EVIDENCE_COMBINATION_RULES["text_overrides_acoustic"]
+    # A weak keyword against a near-neutral voice: acoustic - text / 2 would be negative, the floor keeps it at 0.
+    assert "confidence = max(0, acoustic - text / 2)" in ec.EVIDENCE_COMBINATION_RULES["acoustic_kept_text_disagrees"]
+    text = classify_text_emotion("box box, I am so angry")
+    assert combine_evidence(EmotionType.NEUTRAL, 0.1, text) == (EmotionType.NEUTRAL, 0.0, "acoustic_kept_text_disagrees")
+    assert set(ec.EVIDENCE_COMBINATION_RULES) == set(get_args(EvidenceCombination))  # a text for every rule
+    assert "not a probability" in ec.DISCLAIMER and "acoustic_confidence_rule" in ec.DISCLAIMER

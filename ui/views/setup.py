@@ -7,21 +7,26 @@ dimensionless heuristic penalty, not a lap time, and "confidence" is multi-start
 from __future__ import annotations
 
 import re
-import time
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
-from ui.api_client import ApiError, ApiUnavailable, get_client
+from ui.api_client import get_client
 from ui.components import (
+    KEEP,
     FieldLabels,
+    clock_time,
     example_inputs_badge,
     heuristic_badge,
-    json_expander,
+    humanise,
     md_text,
-    show_request_error,
+    not_modelled_text,
+    render_form_outcome,
+    round4,
+    seed_form,
+    submit_form,
     unchanged_example,
 )
 
@@ -54,7 +59,7 @@ FORM_DEFAULTS: Dict[str, Any] = {
     "setup_n_trials": 128,
     "setup_seed": 42,
 }
-# (label, key in the response, key in the baseline, unit key in "units", pin name in "pinned_by_driver")
+# (label, path in the response and in "baseline_setup", unit key in "units", pin name in "pinned_by_driver")
 PARAMETERS = (
     ("Ride height", ("ride_height",), "ride_height", "ride_height"),
     ("Front wing angle", ("front_wing_angle",), "front_wing_angle", "front_wing_angle"),
@@ -69,7 +74,6 @@ PARAMETERS = (
     ("Rear springs", ("suspension_settings", "rear_spring"), "suspension_settings", "rear_spring"),
 )
 OUTCOME_KEY = "setup_outcome"
-KEEP = "session"  # form values survive page switches (persist_state)
 API_DEFAULT_HELP = "Leave empty to let the API assume its default (listed under assumed defaults)."
 # A unit that names a 0-100 adjuster scale (differential and suspension): 0 and 100 are the ends of the search.
 ZERO_TO_HUNDRED = re.compile(r"\b0-100\b")
@@ -88,16 +92,12 @@ FIELD_LABELS = {
 FIELDS = FieldLabels(FIELD_LABELS)
 
 
-def rounded(value: Optional[float]) -> Optional[float]:
-    return None if value is None else round(float(value), 4)
-
-
 def build_request() -> Dict[str, Any]:
     """The SetupRequest body from the submitted form; empty optional fields are left out."""
 
     state = st.session_state
     preferences: Dict[str, Any] = {
-        name: rounded(state[f"setup_{name}"])
+        name: round4(state[f"setup_{name}"])
         for name in ("risk_tolerance", "tire_management")
         if state[f"setup_{name}"] is not None  # left out: the API assumes its default and reports it
     }
@@ -122,7 +122,7 @@ def build_request() -> Dict[str, Any]:
         "low_speed_sections": state["setup_low_speed_sections"],
         "track_type": state["setup_track_type"],
         "average_speed": state["setup_average_speed"],
-        "downforce_requirement": rounded(state["setup_downforce_requirement"]),
+        "downforce_requirement": round4(state["setup_downforce_requirement"]),
     }
     if state["setup_track_name"].strip():
         track["track_name"] = state["setup_track_name"].strip()
@@ -159,7 +159,7 @@ def render_form() -> Optional[Dict[str, Any]]:
         columns[1].selectbox(
             "Track type",
             TRACK_TYPES,
-            format_func=lambda value: value.replace("_", " "),
+            format_func=humanise,
             key="setup_track_type",
             persist_state=KEEP,
             help="Sets the heuristic kerb and bump severity.",
@@ -370,7 +370,7 @@ def render_setup(outcome: Mapping[str, Any]) -> None:
         example_inputs_badge()
     st.caption(
         f"{md_text(str(body.get('model_scope', '')).capitalize())}. Result for the request sent at "
-        f"{time.strftime('%H:%M:%S', time.localtime(outcome['at']))}."
+        f"{clock_time(outcome['at'])}."
     )
     baseline_value, improvement = body.get("baseline_objective_value"), body.get("improvement_over_baseline")
     columns = st.columns(4)
@@ -443,7 +443,7 @@ def render_setup(outcome: Mapping[str, Any]) -> None:
         st.markdown(f"**Tyre pressures** ({md_text(units.get('tire_pressures_psi', 'psi'))})")
         columns = st.columns(len(pressures))
         for column, (corner, value) in zip(columns, pressures.items(), strict=True):
-            column.metric(corner.replace("_", " ").capitalize(), f"{value:.2f}")
+            column.metric(humanise(corner).capitalize(), f"{value:.2f}")
         st.caption(md_text(body.get("tire_pressure_basis", "")))
 
     balance = body.get("handling_balance") or {}
@@ -451,13 +451,13 @@ def render_setup(outcome: Mapping[str, Any]) -> None:
         st.markdown(f"**Handling balance** ({md_text(units.get('handling_balance', ''))})")
         columns = st.columns(len(balance))
         for column, (name, value) in zip(columns, balance.items(), strict=True):
-            column.metric(name.replace("_", " ").capitalize(), f"{value:+.4f}")
+            column.metric(humanise(name).capitalize(), f"{value:+.4f}")
 
     breakdown = body.get("objective_breakdown") or {}
     if breakdown:
         st.markdown("**Remaining objective penalties** (what the recommended setup still trades off)")
         frame = pd.DataFrame(
-            [{"Term": name.replace("_", " "), "Penalty": value} for name, value in breakdown.items()]
+            [{"Term": humanise(name), "Penalty": value} for name, value in breakdown.items()]
         ).sort_values("Penalty", ascending=False)
         chart = (
             alt.Chart(frame)
@@ -484,27 +484,27 @@ def render_setup(outcome: Mapping[str, Any]) -> None:
     )
     st.markdown("**Limitations** (from the API)")
     limitations = [
-        f"Scope: {body.get('model_scope', '')}.",
-        f"Objective: {body.get('objective_description', '')}",
-        f"Tyre pressures: {body.get('tire_pressure_basis', '')}",
+        md_text(f"Scope: {body.get('model_scope', '')}."),
+        md_text(f"Objective: {body.get('objective_description', '')}"),
+        md_text(f"Tyre pressures: {body.get('tire_pressure_basis', '')}"),
     ]
     not_modelled = body.get("inputs_not_modelled") or []
     if not_modelled:
-        limitations.append(f"Accepted but not modelled: {', '.join(not_modelled)}.")
-    st.markdown("\n".join(f"- {md_text(item)}" for item in limitations))
+        limitations.append(not_modelled_text(not_modelled))
+    st.markdown("\n".join(f"- {item}" for item in limitations))
 
     with st.expander("Search details", icon=":material/query_stats:"):
         st.markdown(
             f"{md_text(body.get('optimization_method', ''))}: {body.get('trials')} trials (seed {body.get('seed')}); "
             f"best trial #{body.get('best_trial_number')} scored {body.get('best_trial_objective', 0):.3f}; "
-            f"selected: {md_text(str(body.get('selected_source', '')).replace('_', ' '))}."
+            f"selected: {md_text(humanise(body.get('selected_source', '')))}."
         )
         st.caption(md_text(body.get("refinement_method", "")))
         starts = body.get("refinement_starts") or []
         if starts:
             st.dataframe(
                 [
-                    {"Start": s["start"].replace("_", " "), "Start objective": s["start_objective"],
+                    {"Start": humanise(s["start"]), "Start objective": s["start_objective"],
                      "Refined objective": s["refined_objective"], "Max parameter deviation": s["max_parameter_deviation"],
                      "Evaluations": s["evaluations"], "Converged": s["converged"]}
                     for s in starts
@@ -519,16 +519,6 @@ def render_setup(outcome: Mapping[str, Any]) -> None:
             )
 
 
-def render_outcome(outcome: Mapping[str, Any]) -> None:
-    if outcome.get("error") is not None:
-        show_request_error(outcome["error"], "The setup request", FIELDS)
-    else:
-        render_setup(outcome)
-    json_expander(outcome["request"], "Request sent to the API")
-    if outcome.get("response") is not None:
-        json_expander(outcome["response"])
-
-
 st.title("Car setup")
 heuristic_badge()
 st.caption(
@@ -537,23 +527,13 @@ st.caption(
     "bottoming, compliance and tyre wear for the track and weather below. It is not a vehicle-dynamics "
     "simulator: validate any setup in a simulator or on track."
 )
-for widget_key, default in FORM_DEFAULTS.items():
-    st.session_state.setdefault(widget_key, default)
+seed_form(FORM_DEFAULTS)
 
 setup_request = render_form()
 if setup_request is not None:
-    result: Dict[str, Any] = {
-        "request": setup_request,
-        "response": None,
-        "error": None,
-        "at": time.time(),
-        "example": unchanged_example(FORM_DEFAULTS),
-    }
     with st.spinner("Searching setups..."):
-        try:
-            result["response"] = get_client().recommend_setup(setup_request)
-        except (ApiUnavailable, ApiError) as exc:
-            result["error"] = exc
-    st.session_state[OUTCOME_KEY] = result
+        st.session_state[OUTCOME_KEY] = submit_form(
+            setup_request, get_client().recommend_setup, example=unchanged_example(FORM_DEFAULTS)
+        )
 if st.session_state.get(OUTCOME_KEY):
-    render_outcome(st.session_state[OUTCOME_KEY])
+    render_form_outcome(st.session_state[OUTCOME_KEY], "The setup request", FIELDS, render_setup)

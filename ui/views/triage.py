@@ -6,20 +6,23 @@ regulations page, which answers from the official FIA documents with citations.
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict, Mapping, Optional
 
 import streamlit as st
 
-from ui.api_client import ApiError, ApiUnavailable, get_client
+from ui.api_client import get_client
 from ui.components import (
+    KEEP,
     FieldLabels,
+    clock_time,
     example_inputs_badge,
     heuristic_badge,
-    json_expander,
+    humanise,
     md_text,
     page_links,
-    show_request_error,
+    render_form_outcome,
+    seed_form,
+    submit_form,
     unchanged_example,
 )
 
@@ -38,7 +41,6 @@ FORM_DEFAULTS: Dict[str, Any] = {
     "triage_total_penalties": 4,
 }
 OUTCOME_KEY = "triage_outcome"
-KEEP = "session"  # form values survive page switches (persist_state)
 
 # API field names in the words of the form, for validation errors (HTTP 422).
 FIELD_LABELS = {
@@ -47,10 +49,6 @@ FIELD_LABELS = {
     "total_penalties": "Total penalties on record",
 }  # fmt: skip
 FIELDS = FieldLabels(FIELD_LABELS)
-
-
-def readable(value: Any) -> str:
-    return str(value).replace("_", " ")
 
 
 def build_request() -> Dict[str, Any]:
@@ -85,7 +83,7 @@ def render_form() -> Optional[Dict[str, Any]]:
         columns[0].selectbox(
             "Incident type",
             INCIDENT_TYPES,
-            format_func=readable,
+            format_func=humanise,
             key="triage_incident_type",
             persist_state=KEEP,
             help="Sets the review category and the base severity.",
@@ -93,7 +91,7 @@ def render_form() -> Optional[Dict[str, Any]]:
         columns[1].selectbox(
             "Track condition",
             TRACK_CONDITIONS,
-            format_func=readable,
+            format_func=humanise,
             key="triage_track_condition",
             persist_state=KEEP,
             help="Context only: it never changes the severity. Use 'unknown' when it is not known.",
@@ -101,7 +99,7 @@ def render_form() -> Optional[Dict[str, Any]]:
         columns[2].selectbox(
             "Intent",
             INTENTS,
-            format_func=readable,
+            format_func=humanise,
             key="triage_intent",
             persist_state=KEEP,
             help=(
@@ -143,11 +141,11 @@ def render_triage(outcome: Mapping[str, Any]) -> None:
         example_inputs_badge()
     st.caption(
         f"Method: {md_text(body.get('method', ''))}. Result for the request sent at "
-        f"{time.strftime('%H:%M:%S', time.localtime(outcome['at']))}."
+        f"{clock_time(outcome['at'])}."
     )
     # Text, not a metric: a metric value never wraps, and the category is the main result.
     st.markdown(
-        f"#### Review category: {md_text(readable(body.get('triage_category', '')))}",
+        f"#### Review category: {md_text(humanise(body.get('triage_category', '')))}",
         anchors=False,
         help="Which kind of steward review the case needs; not a predicted sanction.",
     )
@@ -173,7 +171,7 @@ def render_triage(outcome: Mapping[str, Any]) -> None:
     if adjustments:
         st.dataframe(
             [
-                {"Input": readable(item["source"]), "Value": readable(item["value"]), "Change": item["delta"]}
+                {"Input": humanise(item["source"]), "Value": humanise(item["value"]), "Change": item["delta"]}
                 for item in adjustments
             ],
             hide_index=True,
@@ -185,7 +183,7 @@ def render_triage(outcome: Mapping[str, Any]) -> None:
     if counted:
         st.caption(
             "Inputs counted for completeness: "
-            + ", ".join(f"{readable(name)} {'supplied' if given else 'not supplied'}" for name, given in counted.items())
+            + ", ".join(f"{humanise(name)} {'supplied' if given else 'not supplied'}" for name, given in counted.items())
             + "."
         )
 
@@ -201,16 +199,6 @@ def render_triage(outcome: Mapping[str, Any]) -> None:
         st.caption(md_text(body["disclaimer"]))
 
 
-def render_outcome(outcome: Mapping[str, Any]) -> None:
-    if outcome.get("error") is not None:
-        show_request_error(outcome["error"], "The triage request", FIELDS)
-    else:
-        render_triage(outcome)
-    json_expander(outcome["request"], "Request sent to the API")
-    if outcome.get("response") is not None:
-        json_expander(outcome["response"])
-
-
 st.title("Incident triage")
 heuristic_badge()
 st.warning(
@@ -221,22 +209,12 @@ st.warning(
     icon=":material/gavel:",
 )
 page_links(["regulations"])
-for widget_key, default in FORM_DEFAULTS.items():
-    st.session_state.setdefault(widget_key, default)
+seed_form(FORM_DEFAULTS)
 
 triage_request = render_form()
 if triage_request is not None:
-    result: Dict[str, Any] = {
-        "request": triage_request,
-        "response": None,
-        "error": None,
-        "at": time.time(),
-        "example": unchanged_example(FORM_DEFAULTS),
-    }
-    try:
-        result["response"] = get_client().predict_penalty(triage_request)
-    except (ApiUnavailable, ApiError) as exc:
-        result["error"] = exc
-    st.session_state[OUTCOME_KEY] = result
+    st.session_state[OUTCOME_KEY] = submit_form(
+        triage_request, get_client().predict_penalty, example=unchanged_example(FORM_DEFAULTS)
+    )
 if st.session_state.get(OUTCOME_KEY):
-    render_outcome(st.session_state[OUTCOME_KEY])
+    render_form_outcome(st.session_state[OUTCOME_KEY], "The triage request", FIELDS, render_triage)

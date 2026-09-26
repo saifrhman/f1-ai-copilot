@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from scripts.fetch_fia_regulations import discover_pdf_urls, fetch_regulations, validate_pdf_bytes
+from scripts.fetch_fia_regulations import discover_candidates, fetch_regulations, latest_candidates, validate_pdf_bytes
 from tests.helpers import write_pdf
 
 CATEGORY = "https://www.fia.com/regulation/category/2182"
@@ -52,6 +55,13 @@ def pdf_bytes(tmp_path):
     return make
 
 
+def latest_urls(category_html, year):
+    """Latest issue URL for each A-F section found on the category page, as the downloader chooses it."""
+
+    latest = latest_candidates(discover_candidates(category_html, CATEGORY, year))
+    return {section: candidate.url for section, candidate in latest.items()}
+
+
 def _site(pdf_bytes, issues):
     anchors, pages = [], {}
     for section, issue, date in issues:
@@ -63,10 +73,10 @@ def _site(pdf_bytes, issues):
 
 
 def test_discovery_picks_latest_issue_regardless_of_page_order():
-    old, old_url = _link("B", 5, "2026-02-27")
+    old, _ = _link("B", 5, "2026-02-27")
     new, new_url = _link("B", 8, "2026-08-05")
     for page in (old + new, new + old):
-        assert discover_pdf_urls(page, CATEGORY, 2026) == {"B": new_url}
+        assert latest_urls(page, 2026) == {"B": new_url}
 
 
 def test_discovery_ignores_other_years_and_non_section_pdfs():
@@ -74,7 +84,7 @@ def test_discovery_ignores_other_years_and_non_section_pdfs():
         '<a href="/docs/fia_2025_f1_regulations_-_section_b_sporting_-_iss_09_-_2025-12-01.pdf">x</a>'
         '<a href="/docs/fia_2026_formula_1_sporting_regulations_pu_-_issue_7_-_2024-10-17.pdf">y</a>'
     )
-    assert discover_pdf_urls(page, CATEGORY, 2026) == {}
+    assert latest_urls(page, 2026) == {}
 
 
 def test_discovery_uses_the_regulation_year_not_issue_dates():
@@ -83,9 +93,9 @@ def test_discovery_uses_the_regulation_year_not_issue_dates():
         '<a href="/docs/fia_2026_f1_regulations_-_section_c_technical_-_iss_20_-_2026-08-05.pdf">2026 C</a>'
         '<a href="/download.php?file=fia_2026_f1_regulations_-_section_a_x.pdf">query-string link</a>'
     )
-    found = discover_pdf_urls(page, CATEGORY, 2026)
+    found = latest_urls(page, 2026)
     assert list(found) == ["C"] and "fia_2026_f1" in found["C"]
-    assert discover_pdf_urls(page, CATEGORY, 2027)["C"].endswith("iss_2_-_2026-08-05_0.pdf")
+    assert latest_urls(page, 2027)["C"].endswith("iss_2_-_2026-08-05_0.pdf")
 
 
 def test_dry_run_downloads_nothing(tmp_path, pdf_bytes):
@@ -121,6 +131,9 @@ def test_new_issue_replaces_superseded_file_but_keeps_user_files(tmp_path, pdf_b
     assert names == ["fia_2026_f1_regulations_-_section_b_example_-_iss_08_-_2026-08-05.pdf", "my_notes.pdf"]
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["removed_superseded_files"] == ["fia_2026_f1_regulations_-_section_b_example_-_iss_05_-_2026-02-27.pdf"]
+    entry = manifest["documents"][0]
+    assert (entry["issue"], entry["issue_date"]) == (8, "2026-08-05")
+    assert entry["superseded_issues_on_page"] == [_link("B", 5, "2026-02-27")[1]]
 
 
 def test_html_masquerading_as_pdf_is_rejected_and_nothing_is_replaced(tmp_path, pdf_bytes):
@@ -178,3 +191,15 @@ def test_unreadable_previous_manifest_still_prunes_superseded_official_files(tmp
     (out / "manifest.json").write_text("{ not json")
     fetch_regulations(out, 2026, ["B"], CATEGORY, session=FakeSession(_site(pdf_bytes, [("B", 8, "2026-08-05")])))
     assert sorted(p.name for p in out.glob("*.pdf")) == ["fia_2026_f1_regulations_-_section_b_example_-_iss_08_-_2026-08-05.pdf"]
+
+
+def test_the_downloader_loads_nothing_beyond_requests_and_pypdf(tmp_path):
+    # .github/workflows/fia-source-check.yml runs it with only requests and pypdf installed; it shares the
+    # file-name grammar with the RAG ingestion through the standard-library module fia_files.
+    script = Path(__file__).resolve().parents[1] / "scripts" / "fetch_fia_regulations.py"
+    probe = "import runpy, sys; runpy.run_path(sys.argv[1]); print(chr(10).join(sys.modules))"
+    loaded = subprocess.run(
+        [sys.executable, "-c", probe, str(script)], cwd=tmp_path, capture_output=True, text=True, check=True
+    ).stdout.split()
+    assert "core_modules.rule_checker.fia_files" in loaded
+    assert not [name for name in loaded if name.startswith(("langchain", "openai", "qdrant_client", "core_modules.rule_checker.fia_rag"))]

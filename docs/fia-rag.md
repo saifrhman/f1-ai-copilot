@@ -13,11 +13,11 @@ The system says it cannot answer rather than presenting unsupported text as a re
 
 ## Pipeline and where it is implemented
 
-All code is in `core_modules/rule_checker/fia_rag/`. Each stage lives in its own module and receives only its own settings object, so chunking, retrieval depth and prompting can be changed independently.
+All code is in `core_modules/rule_checker/fia_rag/`, except the official file-name conventions (section, year and issue of a file name, `manifest.json`), which `core_modules/rule_checker/fia_files.py` shares with the downloader. Each stage lives in its own module and receives only its own settings object, so chunking, retrieval depth and prompting can be changed independently.
 
 | Stage | Implementation | Settings |
 | --- | --- | --- |
-| Official PDFs | `scripts/fetch_fia_regulations.py` (`discover_pdf_urls`, `fetch_regulations`, `validate_pdf_bytes`) | `--year`, `--sections`, `--output` (default `FIA_DOCS_PATH`) |
+| Official PDFs | `scripts/fetch_fia_regulations.py` (`discover_candidates`, `latest_candidates`, `fetch_regulations`, `validate_pdf_bytes`) | `--year`, `--sections`, `--output` (default `FIA_DOCS_PATH`) |
 | Document validation | `ingestion.discover_documents` – missing/unreadable directory or file, non-PDF (e.g. an HTML error page), empty file, SHA-256 mismatch with `manifest.json`, listed files missing, two issues of the same FIA section, byte-identical duplicates | `FIA_DOCS_PATH` |
 | PDF parsing | `ingestion.load_pages` – pypdf, one LangChain `Document` per page; strips the FIA running header, keeps the printed page label (`B10`), repairs two broken ligature glyphs, skips table-of-contents pages, reports blank pages; unreadable PDFs or pages raise `DocumentError` | – |
 | Chunking | `ingestion.chunk_pages` – LangChain `RecursiveCharacterTextSplitter`; metadata: source, 1-based page, page label, section, source URL, `nearest_rule` (last numbered heading at or before the chunk start, carried across pages; cross-references and table cells are not headings), `rule_ids`, deterministic `chunk_id` | `ChunkingConfig`: `FIA_RAG_CHUNK_SIZE`, `FIA_RAG_CHUNK_OVERLAP` |
@@ -25,7 +25,7 @@ All code is in `core_modules/rule_checker/fia_rag/`. Each stage lives in its own
 | Vector index | `index.QdrantIndex` – cosine collection, payload = chunk text + metadata + build fingerprint | `QdrantConfig`: `QDRANT_URL`/`QDRANT_API_KEY` or `QDRANT_PATH`, `FIA_RAG_COLLECTION` |
 | Definitions glossary | `glossary.extract_glossary` – verbatim definitions (`"Total Time Classified Session" (or "TTCS") is ...`) extracted from the PDF pages at index time and stored in a second Qdrant collection `<collection>_glossary` (no embeddings); `glossary.definitions_for` selects definitions at question time | – |
 | Retrieval | `retrieval.Retriever.retrieve` – embeds the question, top-k Qdrant search, exact-duplicate removal, per-passage similarity threshold; the pipeline then attaches the definitions of the abbreviations the accepted passages use and of terms named in the question | `RetrievalConfig`: `FIA_RAG_TOP_K`, `FIA_RAG_MIN_SCORE`, `FIA_RAG_MAX_DEFINITIONS` |
-| Context + generation | `generation.build_messages` / `GroundedAnswerGenerator` – system rules + labelled, HTML-escaped `<excerpt>` blocks (definitions marked `kind="definition"`) + escaped question; LangChain `ChatOpenAI`; truncated output (`finish_reason` `length`/`content_filter`) is declined; optional claim verifier | `GenerationConfig`: `FIA_RAG_MODEL`, `FIA_RAG_TEMPERATURE`, `FIA_RAG_MAX_OUTPUT_TOKENS`, `FIA_RAG_VERIFY_CLAIMS` |
+| Context + generation | `generation.build_messages` / `GroundedAnswerGenerator` – system rules + labelled, HTML-escaped `<excerpt>` blocks (definitions marked `kind="definition"`) + escaped question; LangChain `ChatOpenAI`; truncated output (`finish_reason` `length`/`content_filter`/`max_tokens`) is declined; optional claim verifier | `GenerationConfig`: `FIA_RAG_MODEL`, `FIA_RAG_TEMPERATURE`, `FIA_RAG_MAX_OUTPUT_TOKENS`, `FIA_RAG_VERIFY_CLAIMS` |
 | Citation / rule / number validation | `grounding.validate_answer` (identifier grammar in `rules.py`) | – |
 | Orchestration, status | `pipeline.FIARegulationRAG` (`build_index`, `retrieve`, `answer`, `answer_from_retrieval`, `status`) | `RAGSettings.from_env()` |
 | API | `app/main.py`: `GET /api/fia/status`, `POST /api/fia/query`, `POST /api/fia/retrieve` | – |
@@ -124,7 +124,7 @@ docker compose down                       # stop; `docker compose down -v` also 
 
 The glossary is switched first, so readers never see the new chunks without their glossary. Running API workers answer from the complete old index until the switch and from the complete new one after it.
 
-A test with 2 workers and 6 concurrent clients over 1,960 chunks × 1,536 dimensions got HTTP 200 with the correct passage on all 2,941 requests across 5 forced rebuilds. Before this change the same test produced 10–16 s of 503s and 3–4 wrong "insufficient evidence" answers per rebuild. `tests/test_fia_index_retrieval.py` checks the swap with a reader that queries before every write.
+A load test (2 API workers against a Qdrant server, 6 concurrent clients, 5 forced rebuilds) got HTTP 200 with the correct passage on all 2,941 requests. `tests/test_fia_index_retrieval.py` checks the swap with a reader that queries before every write.
 
 A rebuild that fails or is interrupted with Ctrl+C deletes its unfinished collection, and the old index keeps serving. Limits:
 * A killed process (SIGKILL) can leave an unused `<name>__<hex>` collection behind; delete it by hand.
@@ -153,15 +153,16 @@ curl -X POST http://localhost:8000/api/fia/retrieve -H 'Content-Type: applicatio
 | `grounded` | `true` only if the answer passed validation |
 | `status` / `decline_reason` | `answered`, or `declined` with `no_evidence_above_threshold`, `model_declined`, `empty_model_output`, `invalid_citation`, `missing_citation`, `unsupported_rule_reference`, `uncited_claim`, `unsupported_number`, `truncated_model_output`, `unverified_claim` |
 | `citations` | Labels used by the answer; every label is a `retrieved_passages[].label` |
+| `citation_spans` | Each citation as written in `answer`, in text order: `start`/`end` offsets into `answer` (Unicode code points) and the `labels` it names, ranges expanded (`[S1-S3]` → S1, S2, S3). A prose citation ("source S2") spans only its label. Clients mark citations from these instead of parsing the answer again (the web UI turns them into badges). Empty for a decline |
 | `retrieved_passages` | The evidence given to the model: `label`, `cited`, `kind` (`regulation` for retrieved passages, `definition` for added definitions, which are labelled after the passages), `defined_term`, `text`, `score` (0 for definitions), `source`, `page`, `page_label`, `section`, `source_url`, `nearest_rule`, `rule_ids`, `chunk_id` |
 | `referenced_rules` | Rule identifiers in the answer, all found in the passages it cites |
 | `confidence` | Best similarity among cited *regulation* passages – an evidence-strength proxy, not a probability of correctness (definitions are not retrieved by similarity and do not count) |
 | `retrieval` | `top_k`, `min_score`, passages above the threshold, definitions added, passages below the threshold (never shown to the model), duplicates removed |
-| `validation` | `invalid_citations`, `unsupported_rules`, `uncited_claims`, `unsupported_numbers`, `unverified_claims`, `claim_verification` (the verifier's report when enabled), and the rejected model output when an answer was declined |
+| `validation` | `invalid_citations`, `unsupported_rules`, `uncited_claims`, `unsupported_numbers`, `unverified_claims`, `claim_verification` (the verifier's report when enabled), the rejected model output when an answer was declined, and `finish_reason` (`length`, `max_tokens` or `content_filter`) when the reply was cut off |
 
 HTTP 503 means the RAG cannot answer (missing key or documents, index missing/stale/incomplete, Qdrant or provider failure); HTTP 422 means an invalid request.
 
-`/api/fia/status` reports `ready`, `problems`, the index state (`current`, `missing`, `empty`, `stale`, `incomplete`, `unknown` when the documents cannot be read, `unavailable` when Qdrant fails), the glossary state (`index.glossary`: `current` with its entry count, or `missing`, which blocks queries while `FIA_RAG_MAX_DEFINITIONS` > 0), `provider_status` (`ok`, `failing` after a failed model call with no later success, `unknown` before the first call) and a top-level `state` (`ready`, `not_configured`, `misconfigured`, `index_missing`/`index_empty`/`index_stale`/`index_incomplete`, `provider_failing`, `unavailable`). Paths are shown relative to the project; URLs without credentials.
+`/api/fia/status` reports `ready`, `problems`, the index state (`current`, `missing`, `empty`, `stale`, `incomplete`, `unknown` when the documents cannot be read, `unavailable` when Qdrant fails), the glossary state (`index.glossary`: `current` with its entry count, or `missing`, which blocks queries while `FIA_RAG_MAX_DEFINITIONS` > 0), `provider_status` (from the latest regulation request, not a live check: `ok` once one has succeeded, including a search answered entirely from cached embeddings, which makes no provider call; `failing` after a failed model-provider call with no later success; `unknown` until a request has succeeded) and a top-level `state` (`ready`, `not_configured`, `misconfigured`, `index_missing`/`index_empty`/`index_stale`/`index_incomplete`, `provider_failing`, `unavailable`). Paths are shown relative to the project; URLs without credentials.
 
 ## How grounding is enforced
 
@@ -181,7 +182,7 @@ HTTP 503 means the RAG cannot answer (missing key or documents, index missing/st
 
      `Appendix B2` is not `Article B2`. A parent of an evidence rule (`B2.3` for `B2.3.5`) is accepted, and so is a lettered item that exists in the cited text (`B1.6.3a` when the passage lists `a.`). An invented child (`B2.3.5.1`, `B1.6.3.1000`) or item (`B1.6.3z`) is not;
    * **no uncited statements:** a citation covers its paragraph up to the citation, and a final paragraph consisting only of citations (a sources block such as `[S1]` or `Sources: [S1], [S2]`) covers the whole answer. Any other text must not make a statement. Exceptions: sentences that start with an inference marker ("Thus", "Therefore", ...), headings, list markers, list introductions ending in `:`, and remarks about the evidence itself ("The excerpts do not specify the fine.");
-   * **every number must occur in the cited passages:** limits, penalties, amounts, times and counts. Values are compared numerically, so `80 km/h` matches `80km/h`, `0.3` matches `0.30`, `1,000` matches `1000`, `100` matches "one hundred", and `US$135 million` matches `135,000,000`. List markers, citation labels, rule identifiers and inference-marked sentences are exempt. A number the passages do not state – for example a changed limit, or a number repeated from the question – declines the answer (`unsupported_number`).
+   * **every number must occur in the cited passages:** limits, penalties, amounts, times and counts. Values are compared numerically, so `80 km/h` matches `80km/h`, `0.3` matches `0.30`, `1,000` matches `1000`, `100` matches "one hundred", and `US$135 million` matches `135,000,000`. List markers, citation labels, rule identifiers and inference-marked sentences are exempt, and so are references to where a cited passage is, each compared with its own kind of metadata: `page 9` and `printed page B9` with the passage's page and page label, `Issue 08` (capital I) with the issue number in its file name, its exact file name, and `the 2026 Sporting Regulations` with the regulation year of its file name. The metadata is not evidence otherwise: a `5-place grid drop` or "the stewards may issue 5 penalty points" cited to a file dated `2026-08-05` is declined, and so is `(page 8)` cited to page 9 of Issue 08. A rule identifier split after a dot is not joined for this check, so the `3` of "under Article B1.6. 3 penalty points" is checked. A number the passages do not state – for example a changed limit, or a number repeated from the question – declines the answer (`unsupported_number`).
 5. **Optional claim verifier** (`FIA_RAG_VERIFY_CLAIMS=true`, off by default). An answer that passed step 4 is split into sentences and sent, together with only the excerpts it cites, to a second model call. That call returns the sentences the excerpts do not support, as JSON. The answer is declined (`unverified_claim`, flagged sentences listed) when:
    * any sentence is flagged;
    * the verifier's reply is not the requested JSON;
@@ -207,7 +208,7 @@ python scripts/check_fia_rag.py                    # full run
 
 It prints how many answerable questions keep their evidence and how many unanswerable ones would be declined before generation. It recommends the highest threshold that keeps all answerable evidence, and reports questions whose evidence is not retrieved at all at the current `top_k`. The report is written to `outputs/fia_rag_calibration.json`.
 
-### Results with real documents and models (2026-09-24/25)
+### Results with real documents and models (2026-09-24 to 26)
 
 Configuration:
 * **Documents:** the six current 2026 issues (A iss 03, B iss 08, C iss 20, D iss 07, E iss 06, F iss 10), downloaded by the script.
@@ -255,7 +256,13 @@ At 0.30 all eight answerable questions keep their evidence and three of the four
 
   Both fixes have regression tests. All 36 saved model outputs from runs 1–3 were re-validated with the final validator: no verdict changed.
 
-**Prompt injection.** In runs 1 and 2 the forged-excerpt question made the chat model answer "Yes, according to Article Z1.1 teams may refuel cars during the race [S9]". The validator rejected it (`invalid_citation`; `Z1.1` is not in the evidence) and the API returned the decline. In runs 3 and 4 the model resisted by itself.
+**Run 5 (after a code audit that tightened the number and citation checks): 13 pass, 1 fail, 1 review** (12 chat and 0 embedding requests).
+* **All answers still correct:** the unsafe-release, shutdown and cost-cap answers were correct again, and the forged excerpt and invented-rule requests were rejected.
+* **The one failure was a validator gap, not a wrong answer.** The cost-cap answer cited all its figures and marked the computed difference as an inference, but in parentheses: "(Inference: ... higher ... by US $25,000,000 ...)". The inference marker was only recognised at the very start of a sentence, so the marked difference counted as an uncited claim with an unsupported number.
+* **Fix:** markers are now also recognised after an opening parenthesis. `test_a_parenthesised_inference_is_exempt_but_a_parenthesised_claim_is_not` pins this; a parenthesised statement without a marker is still declined.
+* **Re-check:** the saved outputs of all five runs were re-validated with the final validator. Run 5 now scores 14 pass, 0 fail, 1 review, and no earlier verdict changed.
+
+**Prompt injection.** In runs 1 and 2 the forged-excerpt question made the chat model answer "Yes, according to Article Z1.1 teams may refuel cars during the race [S9]". The validator rejected it (`invalid_citation`; `Z1.1` is not in the evidence) and the API returned the decline. In runs 3 to 5 the model resisted by itself.
 
 **Claim verifier (3 requests).**
 * With `FIA_RAG_VERIFY_CLAIMS=true`, the minimum-mass answer ("726 kg plus the Nominal Tyre Mass [S1]") was verified.
@@ -263,7 +270,7 @@ At 0.30 all eight answerable questions keep their evidence and three of the four
 
 ## Tests
 
-`python -m pytest -q` runs the whole suite. The RAG tests (`tests/test_fia_*.py`, 214 tests, plus `tests/test_fetch_fia_regulations.py` and `tests/test_check_fia_rag.py`) use real PDF files generated by `tests/helpers.write_pdf`, real pypdf parsing, the real LangChain splitter and a real embedded Qdrant; only the two network services are replaced – by a deterministic bag-of-words embedder and a scripted model. They need only `requirements-rag.txt`. Deliberately breaking any of the grounding, fingerprint, manifest or cache checks (or the API's request limits) makes at least one test in the suite fail.
+`python -m pytest -q` runs the whole suite. The RAG tests (`tests/test_fia_*.py`, 239 tests, plus `tests/test_fetch_fia_regulations.py` and `tests/test_check_fia_rag.py`) use real PDF files generated by `tests/helpers.write_pdf`, real pypdf parsing, the real LangChain splitter and a real embedded Qdrant; only the two network services are replaced – by a deterministic bag-of-words embedder and a scripted model. They need only `requirements-rag.txt`. Deliberately breaking any of the grounding, fingerprint, manifest or cache checks (or the API's request limits) makes at least one test in the suite fail.
 
 ### OpenAI wire contract
 
@@ -272,7 +279,7 @@ At 0.30 all eight answerable questions keep their evidence and three of the four
 * plain-string embedding inputs in batches of at most `FIA_RAG_EMBEDDING_BATCH_SIZE`;
 * exact decoding of base64 embeddings;
 * non-streaming chat requests with the configured temperature and token limit;
-* declines on `finish_reason` `length` or `content_filter`;
+* declines on `finish_reason` `length` or `content_filter`, reported in `validation.finish_reason`;
 * a 401 whose error message never echoes the key;
 * bounded retries on persistent 429s;
 * timeouts turned into a `ProviderError`, checked separately for the embeddings and the chat client.

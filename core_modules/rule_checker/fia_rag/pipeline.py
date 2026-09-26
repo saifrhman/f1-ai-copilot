@@ -25,8 +25,9 @@ from .embeddings import EmbeddingService, create_openai_embeddings, open_embeddi
 from .errors import IndexNotReadyError, RAGUnavailableError
 from .generation import GroundedAnswerGenerator, create_chat_model
 from .glossary import GLOSSARY_VERSION, GlossaryEntry, definitions_for, extract_glossary, with_frequencies
+from .grounding import shown_citation_spans
 from .index import IndexState, QdrantIndex, compute_fingerprint, create_qdrant_client
-from .ingestion import DiscoveryResult, discover_documents, load_and_chunk, load_chunks_and_pages
+from .ingestion import DiscoveryResult, discover_documents, load_chunks_and_pages
 from .retrieval import RetrievalResult, RetrievedPassage, Retriever
 
 logger = logging.getLogger(__name__)
@@ -154,8 +155,8 @@ class FIARegulationRAG:
         """Parse and chunk the documents without calling the embedding API (a dry run)."""
 
         discovery = self.discover()
-        chunks, reports = load_and_chunk(discovery.documents, self.settings.chunking)
-        characters = sum(len(chunk.text_for_embedding()) for chunk in chunks)
+        chunks, reports, _ = load_chunks_and_pages(discovery.documents, self.settings.chunking)
+        characters = sum(len(chunk.embedding_text) for chunk in chunks)
         batch = self.settings.embedding.batch_size
         return {
             "fingerprint": self.fingerprint(discovery),
@@ -206,7 +207,7 @@ class FIARegulationRAG:
             chunks, reports, pages = load_chunks_and_pages(discovery.documents, self.settings.chunking)
             # Embed everything before touching the existing collection, so a
             # provider failure leaves the previous index intact.
-            vectors = self.embedder().embed_documents([chunk.text_for_embedding() for chunk in chunks], progress=progress)
+            vectors = self.embedder().embed_documents([chunk.embedding_text for chunk in chunks], progress=progress)
             # The glossary goes live first, so that readers in other processes never see the new
             # chunk index without its glossary (each switch-over is atomic, the pair is not).
             definitions = self._store_glossary(fingerprint, chunks, pages)
@@ -272,15 +273,23 @@ class FIARegulationRAG:
         return result
 
     def answer(self, question: str, top_k: Optional[int] = None) -> Dict[str, Any]:
-        return self.answer_from_retrieval(self.retrieve(question, top_k=top_k))
+        retrieval = self.retrieve(question, top_k=top_k)
+        return self.answer_from_retrieval(retrieval, retrieval.definitions)
 
-    def answer_from_retrieval(self, retrieval: RetrievalResult) -> Dict[str, Any]:
-        """Generate and validate an answer for an already-inspected retrieval result."""
+    def answer_from_retrieval(
+        self, retrieval: RetrievalResult, definitions: Optional[List[RetrievedPassage]] = None
+    ) -> Dict[str, Any]:
+        """Generate and validate an answer for an already-inspected retrieval result.
+
+        ``definitions`` are those ``retrieve`` attached to exactly these accepted passages. Without
+        them they are derived again, because the passages may have been re-split
+        (``RetrievalResult.with_threshold`` drops the definitions).
+        """
 
         question = retrieval.question
         try:
-            # Recomputed rather than taken from ``retrieval``: the accepted passages may have been re-split.
-            definitions = self.definitions(retrieval)
+            if definitions is None:
+                definitions = self.definitions(retrieval)
             chat_model = self.chat_model() if retrieval.passages else None
             result = GroundedAnswerGenerator(chat_model, self.settings.generation).generate(
                 question, retrieval.passages, definitions
@@ -309,6 +318,8 @@ class FIARegulationRAG:
             # not a calibrated probability that the answer is correct.
             "confidence": round(max(cited_scores), 4) if validation.grounded and cited_scores else 0.0,
             "citations": validation.citations,
+            # Where the returned answer shows each citation, so clients need no copy of the citation grammar.
+            "citation_spans": shown_citation_spans(validation.answer) if validation.grounded else [],
             "referenced_rules": validation.referenced_rules,
             "retrieved_passages": passages,
             "top_retrieval_score": round(retrieval.top_score, 4),
@@ -330,6 +341,8 @@ class FIARegulationRAG:
                 "claim_verification": result.verification,
                 # Raw model text is only exposed when it was rejected, for inspection.
                 "rejected_model_output": None if validation.grounded else validation.model_output,
+                # What stopped a truncated reply (length, max_tokens, content_filter); None otherwise.
+                "finish_reason": validation.finish_reason,
             },
             "models": {
                 "embedding": self.settings.embedding.model,

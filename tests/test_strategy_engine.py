@@ -81,7 +81,7 @@ def _race(data, **changes):
 
 def _plan_kwargs(data):
     telemetry, car, driver, tires, race, _ = data
-    return dict(telemetry=telemetry, car_status=car, driver_profile=driver, tire_data=tires, race_state=race)
+    return {"telemetry": telemetry, "car_status": car, "driver_profile": driver, "tire_data": tires, "race_state": race}
 
 
 def _assert_invariants(result, current_lap, total_laps):
@@ -143,7 +143,7 @@ def _old_fixed_ratio_split(total_laps, compounds):
 
 
 # ---------------------------------------------------------------------------
-# Kept scenarios (updated to the new result type)
+# Scenarios
 # ---------------------------------------------------------------------------
 
 
@@ -193,7 +193,7 @@ def test_last_laps_never_abort_and_offer_no_stop(weather, laps_left, tyre_state)
     extra = {}
     if tyre_state == "supplied":
         fitted = SOFT if weather == DRY else INTER
-        extra = dict(current_compound=fitted, current_tire_age=6, used_compounds=[MEDIUM])
+        extra = {"current_compound": fitted, "current_tire_age": 6, "used_compounds": [MEDIUM]}
     data = create_test_data(weather, current_lap=current, total_laps=total, **extra)
 
     result = generate_strategy(*data)
@@ -355,8 +355,8 @@ def test_pit_lap_moves_when_degradation_changes():
     "current_lap,total_laps,extra",
     [
         (1, 11, {}),
-        (3, 12, dict(current_compound=SOFT, current_tire_age=9, used_compounds=None)),
-        (5, 14, dict(current_compound=MEDIUM, current_tire_age=2, used_compounds=[SOFT])),
+        (3, 12, {"current_compound": SOFT, "current_tire_age": 9, "used_compounds": None}),
+        (5, 14, {"current_compound": MEDIUM, "current_tire_age": 2, "used_compounds": [SOFT]}),
     ],
 )
 def test_dynamic_programme_matches_brute_force(current_lap, total_laps, extra):
@@ -407,9 +407,9 @@ def _distinct_delta_tyres():
     "weather,extra",
     [
         (DRY, {}),
-        (DRY, dict(current_compound=HARD, current_tire_age=12, used_compounds=[])),
+        (DRY, {"current_compound": HARD, "current_tire_age": 12, "used_compounds": []}),
         (WeatherCondition.WET, {}),
-        (WeatherCondition.INTERMEDIATE, dict(current_compound=INTER, current_tire_age=4)),
+        (WeatherCondition.INTERMEDIATE, {"current_compound": INTER, "current_tire_age": 4}),
     ],
 )
 def test_each_stop_costs_the_delta_of_the_compound_fitted_there(weather, extra):
@@ -421,8 +421,8 @@ def test_each_stop_costs_the_delta_of_the_compound_fitted_there(weather, extra):
         expected = sum(tires[c].pit_stop_delta for c in option.tire_compounds[1:])
         assert option.pit_time_loss_s == pytest.approx(expected)
 
-    kwargs = dict(telemetry=telemetry, car_status=car, driver_profile=driver, tire_data=tires,
-                  race_state=RaceState(20, 52, DRY, 30.0))
+    kwargs = {"telemetry": telemetry, "car_status": car, "driver_profile": driver, "tire_data": tires,
+              "race_state": RaceState(20, 52, DRY, 30.0)}
     assert evaluate_plan([SOFT, HARD], [10, 23], **kwargs).pit_time_loss_s == pytest.approx(30.0)
     assert evaluate_plan([HARD, SOFT], [10, 23], **kwargs).pit_time_loss_s == pytest.approx(20.0)
     assert evaluate_plan([MEDIUM, SOFT, HARD], [5, 5, 23], **kwargs).pit_time_loss_s == pytest.approx(50.0)
@@ -444,7 +444,7 @@ def test_fresh_start_puts_the_costliest_stop_compound_first():
 def _brute_force_by_sequence(data):
     """{ordered compound sequence: (best time over every stint split, rule status)} for EVERY ordering."""
 
-    telemetry, car, driver, tires, race, _ = data
+    _, _, _, tires, race, _ = data
     remaining = race.total_laps - race.current_lap + 1
     usable = DRY_COMPOUNDS if race.weather == DRY else WET_WEATHER_COMPOUNDS
     allowed = [c for c in TireCompound if c in usable and c in tires]
@@ -518,7 +518,7 @@ def test_laps_beyond_peak_window_counts_tyre_laps_after_the_window_end():
 def test_laps_at_performance_floor_are_counted_and_flagged():
     telemetry, car, driver, tires, race, _ = create_test_data(DRY, current_lap=41, total_laps=52)
     cliff = {**tires, SOFT: TireData(SOFT, 1.0, 0.5, 0, (1, 1), 25.0)}  # 1.0, 0.5, then clamped at 0.2
-    kwargs = dict(telemetry=telemetry, car_status=car, driver_profile=driver, tire_data=cliff, race_state=race)
+    kwargs = {"telemetry": telemetry, "car_status": car, "driver_profile": driver, "tire_data": cliff, "race_state": race}
     option = evaluate_plan([SOFT], [12], **kwargs)
     assert option.stint_breakdown[0]["laps_at_performance_floor"] == 10
     assert option.stint_breakdown[0]["end_performance"] == pytest.approx(0.2)
@@ -1093,3 +1093,86 @@ _DELETE = object()
 def test_schema_rejects_invalid_payloads(mutation):
     with pytest.raises(ValidationError):
         StrategyRequest.model_validate(mutation(_payload()))
+
+
+def _engine_case(key, **changes):
+    """Change one engine input of the valid payload (``key`` is an input name, or a compound of tire_data)."""
+
+    def apply(inputs):
+        if isinstance(key, TireCompound):
+            inputs["tire_data"][key] = dataclasses.replace(inputs["tire_data"][key], **changes)
+        elif key == "competition":
+            inputs["competition"] = inputs["competition"] * 2
+        else:
+            inputs[key] = dataclasses.replace(inputs[key], **changes)
+        return inputs
+
+    return apply
+
+
+_TWO_HAMS = [{"driver_id": "HAM", "tire_compound": "soft", "tire_age": 1, "gap_to_leader": 1.0}] * 2
+_THROTTLE = "throttle_aggressiveness"
+
+
+@pytest.mark.parametrize(
+    "schema_mutation, engine_mutation, schema_message, engine_message",
+    [
+        pytest.param(
+            _schema_case(("tire_data", "soft", "compound"), "hard"),
+            _engine_case(SOFT, compound=HARD),
+            "tire_data key 'soft' does not match its compound 'hard'",
+            "tire_data key 'soft' does not match its compound 'hard'",
+            id="tire-data-key",
+        ),
+        pytest.param(
+            _schema_case(("tire_data", "soft", "peak_performance_window"), [8, 2]),
+            _engine_case(SOFT, peak_performance_window=(8, 2)),
+            "peak_performance_window start (8) must be <= end (2)",
+            "tire_data[soft].peak_performance_window start (8) must be <= end (2)",
+            id="peak-window-order",
+        ),
+        pytest.param(
+            _schema_case(("race_state", "current_lap"), 60),
+            _engine_case("race_state", current_lap=60),
+            "current_lap (60) must be <= total_laps (52)",
+            "race_state.current_lap (60) must be <= total_laps (52)",
+            id="lap-range",
+        ),
+        pytest.param(
+            _schema_case(("race_state", "current_tire_age"), _DELETE),
+            _engine_case("race_state", current_tire_age=None),
+            "current_compound and current_tire_age must be given together",
+            "race_state.current_compound and race_state.current_tire_age must be given together",
+            id="fitted-tyre-pair",
+        ),
+        pytest.param(
+            _schema_case(("race_state", "current_compound"), "wet"),
+            _engine_case("race_state", current_compound=WET),
+            "race_state.current_compound 'wet' needs an entry in tire_data",
+            "race_state.current_compound 'wet' needs an entry in tire_data",
+            id="current-compound-tyre-data",
+        ),
+        pytest.param(
+            _schema_case(("driver_profile", _THROTTLE), _DELETE),
+            _engine_case("driver_profile", **{_THROTTLE: None}),
+            f"{_THROTTLE} is required: supply telemetry.{_THROTTLE} or driver_profile.{_THROTTLE}",
+            f"{_THROTTLE} is required: supply telemetry.{_THROTTLE} or driver_profile.{_THROTTLE}",
+            id="driver-value-supplied",
+        ),
+        pytest.param(
+            _schema_case(("competition",), _TWO_HAMS),
+            _engine_case("competition"),
+            "Duplicate competitor driver_id 'HAM'",
+            "Duplicate competitor driver_id 'HAM'",
+            id="unique-driver-ids",
+        ),
+    ],
+)
+def test_schema_and_engine_report_cross_field_errors_alike(schema_mutation, engine_mutation, schema_message, engine_message):
+    # The schema reports the location through pydantic's loc; the engine puts it in the message.
+    with pytest.raises(ValidationError) as schema_error:
+        StrategyRequest.model_validate(schema_mutation(_payload()))
+    assert f"Value error, {schema_message} " in str(schema_error.value)
+    with pytest.raises(ValueError) as engine_error:
+        generate_strategy(**engine_mutation(StrategyRequest.model_validate(_payload()).to_engine_inputs()))
+    assert str(engine_error.value) == engine_message

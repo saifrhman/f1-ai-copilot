@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict, Optional, Union
 
 import streamlit as st
@@ -11,17 +10,20 @@ from ui.api_client import ApiError, ApiUnavailable, get_client
 from ui.components import (
     MODULES,
     PAGES,
-    PROVIDER_STATUS_HELP,
     app_page,
     cached_health,
     clear_health_cache,
+    clock_time,
     docs_reference,
     health_checked_at,
     humanise,
+    index_metrics,
     json_expander,
     local_time,
     md_text,
-    rag_fix_steps,
+    provider_metric,
+    refresh_health_once,
+    render_rag_problems,
     show_api_error,
     state_badge,
     uses_compose,
@@ -48,7 +50,7 @@ def render_intro() -> None:
 
 def render_status_summary(health: Dict[str, Any], base_url: str) -> None:
     checked = health_checked_at()
-    when = f" · checked at {time.strftime('%H:%M:%S', time.localtime(checked))}" if checked else ""
+    when = f" · checked at {clock_time(checked)}" if checked else ""
     st.markdown(f"{state_badge(health.get('status'))} API {md_text(health.get('version', ''))} at `{base_url}`{when}")
     if health.get("status") == "degraded":
         st.caption("Degraded: at least one component below is not ready. The other components keep working.")
@@ -96,7 +98,6 @@ def render_rag(fia: Dict[str, Any], compose: bool) -> None:
     settings = fia.get("settings") or {}
     index = fia.get("index") or {}
     documents = fia.get("documents") or []
-    glossary = index.get("glossary") or {}
     st.markdown(f"{state_badge(state)} Regulation QA")
     if state == "ready":
         st.success(
@@ -105,35 +106,16 @@ def render_rag(fia: Dict[str, Any], compose: bool) -> None:
             icon=":material/verified:",
         )
     if settings:  # absent when the settings themselves are invalid
-        points, expected = index.get("points"), index.get("expected_points")
-        entries = glossary.get("entries")
         with st.container(horizontal=True, gap="medium"):  # wraps on a phone instead of stacking five rows
             st.metric("Documents", len(documents), width="content")
             st.metric("Index", humanise(index.get("status", "unknown")), width="content")
-            st.metric(
-                "Indexed passages",
-                "–" if points is None else points,
-                help=None if expected is None else f"{expected} expected for the current documents and settings",
-                width="content",
-            )
-            st.metric(
-                "Definitions",
-                humanise(glossary.get("status", "unknown")) if entries is None else entries,
-                help="Official definitions of defined terms, added to the evidence when passages use them",
-                width="content",
-            )
-            st.metric(
-                "Model provider", humanise(fia.get("provider_status", "unknown")), help=PROVIDER_STATUS_HELP, width="content"
-            )
-    for problem in fia.get("problems") or []:
-        st.warning(md_text(problem), icon=":material/report:")
+            index_metrics(index)
+            provider_metric(fia)
     if fia.get("provider_status") == "failing" and fia.get("last_error_at"):
         st.caption(f"Last provider error at {local_time(fia['last_error_at'])}.")
     if fia.get("embedding_cache_problem"):
         st.caption(f"Embedding cache: {md_text(fia['embedding_cache_problem'])}")
-    steps = rag_fix_steps(fia, compose)
-    if steps:
-        st.markdown("**Next steps** (from the project folder):\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1)))
+    render_rag_problems(fia, compose)
     if documents:
         with st.expander(f"Documents ({len(documents)})", icon=":material/description:"):
             st.dataframe(
@@ -170,12 +152,8 @@ else:
     except (ApiUnavailable, ApiError) as exc:
         fia_failure = exc
 
-resynced = st.session_state.pop(_RESYNCED_KEY, False)
-if health and fia and (health.get("modules") or {}).get("fia_rag") != fia.get("state") and not resynced:
-    # The cached /health snapshot (sidebar, cards) predates the live index state: refresh both once.
-    clear_health_cache()
-    st.session_state[_RESYNCED_KEY] = True
-    st.rerun()
+# The cached /health snapshot (sidebar, cards) can predate the live index state: refresh both once.
+refresh_health_once(_RESYNCED_KEY, bool(health and fia) and (health.get("modules") or {}).get("fia_rag") != fia.get("state"))
 
 if failure is not None:
     show_api_error(failure, "The status check")

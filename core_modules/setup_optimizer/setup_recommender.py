@@ -52,7 +52,7 @@ Search
    returned setup (see ``CONFIDENCE_METHOD``); ``parameter_spread`` shows how far
    the starts' optima differ per parameter.
 
-The old closed-form target is kept only as a reported ``baseline``; it is never
+The closed-form rule of thumb is only a reported ``baseline``; it is never
 enqueued into the TPE study. Because it is also a refinement start, the returned
 setup is never worse than it.
 
@@ -68,6 +68,8 @@ from enum import Enum
 from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import optuna
+
+from core_modules.strategy_optimizer.strategy_engine import WeatherCondition
 
 # TPE budget. Measured TPE latency is ~0.6-0.8 s at 128 trials and ~2.3 s at 300; the local refinement
 # adds ~15-20 ms per start (three starts). Small budgets are allowed for quick checks: the refinement
@@ -146,13 +148,13 @@ CONFIDENCE_METHOD = (
     "which ones and by how much). It is not a probability that the setup is right and does not measure how "
     "accurate the heuristic model is for a real car."
 )
-NOT_MODELLED_INPUTS = ["track_profile.track_name (label only)", "weather.humidity", "weather.wind_speed"]
 
 
-class WeatherCondition(Enum):
-    DRY = "dry"
-    WET = "wet"
-    INTERMEDIATE = "intermediate"
+def not_modelled_inputs(weather: WeatherData) -> List[str]:
+    """Supplied inputs that change no number: the track name (always a label) and any given humidity/wind."""
+
+    optional = [f"weather.{name}" for name in ("humidity", "wind_speed") if getattr(weather, name) is not None]
+    return ["track_profile.track_name (label only)", *optional]
 
 
 class TrackType(Enum):
@@ -866,7 +868,7 @@ class SetupOptimizer:
             "pinned_by_driver": sorted(pinned),
             # Inputs the request left out, whose engine default was used (e.g. risk_tolerance=0.5).
             "assumed_defaults": list(assumed_defaults),
-            "inputs_not_modelled": list(NOT_MODELLED_INPUTS),
+            "inputs_not_modelled": not_modelled_inputs(weather),
             "reasoning": _generate_reasoning(
                 track_profile, weather, selected, tpe_refined, terms, baseline_value, search.best_value, n_trials,
                 confidence, pinned, assumed_defaults,
@@ -889,24 +891,3 @@ def recommend_setup_from_inputs(inputs: SetupInputs) -> Dict[str, Any]:
         assumed_defaults=inputs.assumed_defaults,
     )
 
-
-def recommend_setup(
-    driver_preferences: Dict[str, Any],
-    track_profile: Dict[str, Any],
-    weather: Dict[str, Any],
-    n_trials: int = DEFAULT_N_TRIALS,
-    seed: int = DEFAULT_SEED,
-) -> Dict[str, Any]:
-    """Dict-based entry point (natural-language handler). Raises ValueError on any invalid input."""
-    from core_modules.setup_optimizer.schemas import SetupRequest  # local import: schemas imports this module
-
-    request = SetupRequest.model_validate(
-        {
-            "driver_preferences": driver_preferences,
-            "track_profile": track_profile,
-            "weather": weather,
-            "n_trials": n_trials,
-            "seed": seed,
-        }
-    )
-    return recommend_setup_from_inputs(request.to_engine_inputs())

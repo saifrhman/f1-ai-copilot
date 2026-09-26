@@ -8,7 +8,7 @@ inverts exactly the model the engine projects with.
 import json
 import math
 import random
-from functools import lru_cache
+from functools import cache
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -71,7 +71,7 @@ def _tire(compound: TireCompound, params: Tuple[float, float, int, int]) -> Tire
     return TireData(compound, base, degradation, warm_up, (max(1, min(warm_up, end)), end), PIT_DELTA)
 
 
-@lru_cache(maxsize=None)
+@cache
 def engine_lap_times(
     compound: TireCompound,
     params: Tuple[float, float, int, int],
@@ -759,7 +759,7 @@ def test_contaminated_history_keeps_the_degradation_structure(seed, kind, junk_f
 def test_alternating_outlier_rejection_keeps_the_largest_set_of_laps():
     # In this seed of the noisy history one soft lap sits on the rejection threshold, and rejection alternates
     # between keeping and dropping it. The larger set is used (only the injected +7 s lap is rejected), with a note.
-    laps, injected = noisy_history_with_outliers(13)
+    laps, _ = noisy_history_with_outliers(13)
     result = _calibrate(laps)
     soft = result.compounds[SOFT]
     assert any(note.startswith("Outlier rejection alternated on borderline laps") for note in soft.notes)
@@ -894,6 +894,26 @@ def _request(**changes):
 def test_request_schema_rejects_invalid_bodies(changes):
     with pytest.raises(ValidationError):
         TyreCalibrationRequest.model_validate(_request(**changes))
+
+
+@pytest.mark.parametrize(
+    "changes, message",
+    [
+        ({"peak_window_end": {"intermediate": 8}}, "peak_window_end is given for 'intermediate', which has no laps"),
+        (
+            {"laps": [_lap(), _lap(pit_in=True), _lap()], "fuel_correction_s_per_lap": 0.05},
+            "fuel_correction_s_per_lap needs race_lap on every unflagged lap; missing on laps[0, 2]",
+        ),
+    ],
+)
+def test_request_schema_and_engine_report_cross_field_errors_alike(changes, message):
+    body = _request(**changes)
+    with pytest.raises(ValidationError) as schema_error:
+        TyreCalibrationRequest.model_validate(body)
+    assert message in str(schema_error.value)
+    with pytest.raises(ValueError) as engine_error:
+        estimate_tire_parameters(**body)
+    assert str(engine_error.value) == message
 
 
 def test_request_schema_round_trip_gives_a_json_safe_response_usable_by_strategy_request():

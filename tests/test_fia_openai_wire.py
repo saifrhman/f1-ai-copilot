@@ -35,7 +35,6 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import pytest
-from qdrant_client import QdrantClient
 
 from core_modules.rule_checker.fia_rag import (
     ChunkingConfig,
@@ -51,9 +50,7 @@ from core_modules.rule_checker.fia_rag import (
 from core_modules.rule_checker.fia_rag.embeddings import create_openai_embeddings
 from core_modules.rule_checker.fia_rag.generation import SYSTEM_PROMPT
 from core_modules.rule_checker.fia_rag.grounding import DeclineReason
-from tests.helpers import HashingEmbeddings, fia_page, write_pdf
-from tests.test_fia_generation import cite_passage_containing
-from tests.test_fia_index_retrieval import FUEL_FLOW, PIT_LANE, REAR_WING, UNSAFE_RELEASE
+from tests.helpers import HashingEmbeddings, cite_passage_containing, write_regulation_corpus
 
 API_KEY = "sk-test-wire"
 EMBEDDING_MODEL = "text-embedding-wire-test"
@@ -361,18 +358,8 @@ def server():
 
 
 @pytest.fixture
-def qdrant():
-    client = QdrantClient(":memory:")
-    yield client
-    client.close()
-
-
-@pytest.fixture
 def docs(tmp_path):
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_LANE), None, fia_page(3, UNSAFE_RELEASE)])
-    write_pdf(folder / "section_c_technical.pdf", [FUEL_FLOW, REAR_WING])
-    return folder
+    return write_regulation_corpus(tmp_path / "fia_docs")
 
 
 @pytest.fixture
@@ -505,7 +492,8 @@ def test_incomplete_completion_is_declined(make_rag, server, finish_reason):
     assert len(server.requests_to(CHAT)) == 1
     assert result["grounded"] is False
     assert result["decline_reason"] == DeclineReason.TRUNCATED == "truncated_model_output"
-    assert result["validation"]["rejected_model_output"].startswith(f"[finish_reason={finish_reason}] The pit lane")
+    assert result["validation"]["finish_reason"] == finish_reason
+    assert result["validation"]["rejected_model_output"] == "The pit lane speed limit is 80km/h [S1] unless the"
     assert result["citations"] == [] and result["confidence"] == 0.0
 
 

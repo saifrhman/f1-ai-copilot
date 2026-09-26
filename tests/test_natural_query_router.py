@@ -16,31 +16,18 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pytest
 import soundfile as sf
-from qdrant_client import QdrantClient
 
-import core_modules.rule_checker.fia_rag.pipeline as rag_pipeline
 from core_modules.llm_query.natural_query import (
     MAX_LAP_SECONDS,
     MAX_QUERY_CHARS,
     MAX_SECTORS,
     MAX_TELEMETRY_LAPS,
-    NaturalQueryProcessor,
     QueryType,
     _compile_term,
     classify_query,
     process_natural_query,
 )
-from core_modules.rule_checker.fia_rag import (
-    DECLINE_ANSWER,
-    ChunkingConfig,
-    EmbeddingConfig,
-    FIARegulationRAG,
-    QdrantConfig,
-    RAGSettings,
-    RetrievalConfig,
-)
-from tests.helpers import HashingEmbeddings, ScriptedChatModel, fia_page, write_pdf
-from tests.test_fia_index_retrieval import FUEL_FLOW, PIT_LANE, REAR_WING, UNSAFE_RELEASE
+from core_modules.rule_checker.fia_rag import DECLINE_ANSWER
 
 REGULATORY_QUESTIONS = [
     # Misroutes reported by the audit (performance / general / technical before the fix).
@@ -152,7 +139,7 @@ GENERAL_QUESTIONS = [
 
 
 def _classify(query, context=None):
-    return NaturalQueryProcessor()._classify_query(query, context)
+    return classify_query(query, context).query_type
 
 
 def _all_matched_terms(decision):
@@ -783,7 +770,6 @@ def test_emotion_query_forwards_the_transcribe_flag(monkeypatch):
     query, audio = "What emotion is in this driver radio clip?", _wav_base64()
 
     requested = process_natural_query(query, {"audio_file": audio, "transcribe": True})["additional_context"]
-    assert requested["transcription_status"] in {"unavailable", "completed"}
     assert requested["transcription_status"] == "unavailable"
     assert "not installed" in requested["transcription_unavailable_reason"]
 
@@ -797,26 +783,13 @@ def test_emotion_query_forwards_the_transcribe_flag(monkeypatch):
 
 
 @pytest.fixture
-def declining_rag(tmp_path, monkeypatch):
+def declining_rag(installed_rag):
     """A real in-memory FIA RAG over generated PDFs whose (scripted) model declines to answer."""
 
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_LANE), None, fia_page(3, UNSAFE_RELEASE)])
-    write_pdf(folder / "section_c_technical.pdf", [FUEL_FLOW, REAR_WING])
-    settings = RAGSettings(
-        docs_path=folder,
-        chunking=ChunkingConfig(chunk_size=400, chunk_overlap=40),
-        embedding=EmbeddingConfig(model="hashing-test-512", batch_size=8),
-        retrieval=RetrievalConfig(top_k=4, min_score=0.2),
-        qdrant=QdrantConfig(collection="router_test"),
-    )
-    llm = ScriptedChatModel("INSUFFICIENT_EVIDENCE")
-    qdrant = QdrantClient(":memory:")
-    rag = FIARegulationRAG(settings, embeddings=HashingEmbeddings(), llm=llm, qdrant_client=qdrant)
+    rag, llm = installed_rag
+    llm.reply = "INSUFFICIENT_EVIDENCE"
     rag.build_index()
-    monkeypatch.setattr(rag_pipeline, "_instance", rag)
-    yield llm
-    qdrant.close()
+    return llm
 
 
 def test_regulatory_query_declined_by_the_rag_claims_no_source_and_no_confidence(declining_rag):

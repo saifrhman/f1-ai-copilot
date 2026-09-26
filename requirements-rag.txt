@@ -3,7 +3,7 @@
 langchain-core==1.6.5
 langchain-text-splitters==1.1.2
 langchain-openai==1.6.6
-openai==3.19.2
+openai==3.19.2  # used through langchain-openai; pinned for the wire behaviour tests/test_fia_openai_wire.py checks
 qdrant-client==1.19.1
 pypdf==6.19.0
 httpx==0.28.1

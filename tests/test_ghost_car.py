@@ -21,7 +21,6 @@ from pydantic import ValidationError
 
 from core_modules.ghost_car import ghost_car_visualizer as ghost
 from core_modules.ghost_car.ghost_car_visualizer import (
-    GhostCarVisualizer,
     artifact_filename,
     compare_laps,
     generate_ghost_comparison,
@@ -224,9 +223,9 @@ def test_speed_calibration_offset_is_normalised_for_line_to_line_laps():
 
 
 def test_without_lap_times_auto_compares_metres_and_warns_about_the_drift():
-    # Replaces the old expectation that auto normalises whenever totals agree
-    # within 3 %: without an official lap time nothing shows that the traces
-    # end on the line, and normalising then fakes a gap (see realistic tests).
+    # Without an official lap time nothing shows that the traces end on the line, so auto
+    # alignment compares metres and warns about the drift, even when the totals agree within
+    # 3 %: normalising them would fake a gap (see the realistic tests).
     lap1, lap2 = make_lap(5, xy=False), make_lap(5, xy=False, speed_scale=1.01)
     result = compare_laps(_request(lap1, lap2))
 
@@ -924,13 +923,6 @@ def test_large_track_renders_from_a_decimated_path(tmp_path):
     decimated = ghost._decimated(lap["x"])
     assert len(decimated) <= ghost.MAX_TRACK_PLOT_POINTS
     assert decimated[0] == lap["x"][0] and decimated[-1] == lap["x"][-1]
-
-
-def test_visualizer_class_binds_output_dir(tmp_path):
-    visualizer = GhostCarVisualizer(output_dir=tmp_path)
-    result = visualizer.generate_ghost_comparison(make_lap(5), make_lap(6), track_section="spa")
-    assert _png_complete(tmp_path / result["artifact_path"])
-    assert not hasattr(visualizer, "create_animation")
 
 
 def test_rendering_never_imports_pyplot(tmp_path):

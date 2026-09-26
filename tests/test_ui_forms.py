@@ -21,12 +21,15 @@ from tests.ui_support import (  # noqa: F401 (pytest fixtures)
     ENTRY_POINT,
     assert_no_exception,
     column_formats,
+    expander_labels,
+    metrics,
     run_page,
+    table_rows,
     ui_api,
     ui_api_down,
 )
-from ui.api_client import CALIBRATE_TYRES_PATH, ApiClient
-from ui.components import md_text
+from ui.api_client import CALIBRATE_TYRES_PATH
+from ui.components import documented_example, md_text
 
 CALIBRATION_LABEL = "Calibrate tyre parameters from lap history"
 HEURISTIC_BADGE = ":orange-badge[:material/science: Heuristic · not validated]"
@@ -71,11 +74,6 @@ DEFAULT_TRIAGE_REQUEST = {
 }
 
 
-@pytest.fixture(autouse=True)
-def _no_api_url(monkeypatch):
-    monkeypatch.delenv("F1_API_URL", raising=False)
-
-
 @pytest.fixture
 def table_edits(monkeypatch) -> Dict[str, pd.DataFrame]:
     """Edited tables by key prefix: AppTest cannot type into a data editor, so its return value is replaced."""
@@ -112,21 +110,17 @@ def sent_json(at: AppTest, marker: str) -> Dict[str, Any]:
     return next(body for body in bodies if marker in body)
 
 
-def metrics(at: AppTest) -> Dict[str, str]:
-    return {metric.label: metric.value for metric in at.metric}
-
-
-def table(at: AppTest, column: str) -> List[Dict[str, Any]]:
-    """Rows of the displayed table that has ``column``."""
-
-    frame = next(element.value for element in at.dataframe if column in element.value.columns)
-    return frame.to_dict("records")
-
-
 def position(at: AppTest, kind: str, text: str) -> int:
     """Where the first ``kind`` element containing ``text`` is in the page (document order)."""
 
     return next(index for index, node in enumerate(at.main) if node.type == kind and text in str(node.value))
+
+
+def plan_details(at: AppTest) -> Any:
+    """The strategy result's only 'Plan details' selectbox (its key names the result it belongs to)."""
+
+    (selectbox,) = [element for element in at.selectbox if element.label == "Plan details"]
+    return selectbox
 
 
 def chart_rows(at: AppTest) -> List[Dict[str, Any]]:
@@ -135,15 +129,6 @@ def chart_rows(at: AppTest) -> List[Dict[str, Any]]:
     (chart,) = at.get("vega_lite_chart")
     (dataset,) = chart.proto.datasets
     return pa.ipc.open_stream(dataset.data.data).read_all().to_pandas().to_dict("records")
-
-
-def expander_labels(at: AppTest) -> List[str]:
-    # AppTest reports an expander with an icon as a status element.
-    return [element.label for element in [*at.expander, *at.status]]
-
-
-def openapi_example(client: ApiClient, schema_name: str) -> Dict[str, Any]:
-    return client.get_openapi()["components"]["schemas"][schema_name]["examples"][0]
 
 
 # ------------------------------------------------------------------ race strategy
@@ -170,7 +155,7 @@ def test_strategy_form_sends_the_example_and_shows_the_api_plans(ui_api):
     time_metric = next(metric for metric in at.metric if metric.label == "Projected time, laps 18-57")
     assert f"{best['projected_race_time']:.3f} s" in time_metric.proto.help
 
-    plans = table(at, "Projected (s)")
+    plans = table_rows(at, "Projected (s)")
     assert list(plans[0])[:3] == ["Rank", "Plan", "Two-compound rule"]  # the rule is visible without scrolling
     for row, option in zip(plans, expected["strategies"], strict=True):
         assert row["Plan"] == option["strategy_id"]
@@ -185,7 +170,7 @@ def test_strategy_form_sends_the_example_and_shows_the_api_plans(ui_api):
     assert list(plans[0]) == ["Rank", "Plan", "Two-compound rule", "Pit laps", "Projected (s)", "Gap to best (s)",
                               "Pit loss (s)"]  # fmt: skip
     plans_frame = next(frame for frame in at.dataframe if "Projected (s)" in frame.value.columns)
-    assert column_formats(plans_frame) == {name: "%.3f" for name in ("Projected (s)", "Gap to best (s)", "Pit loss (s)")}
+    assert column_formats(plans_frame) == dict.fromkeys(("Projected (s)", "Gap to best (s)", "Pit loss (s)"), "%.3f")
     # The Plan column is as wide as its longest id, so no id is cut off.
     longest = max(len(option["strategy_id"]) for option in expected["strategies"])
     assert json.loads(plans_frame.proto.columns)["Plan"]["width"] == round(20 + 7.0 * longest)
@@ -211,29 +196,30 @@ def test_strategy_form_sends_the_example_and_shows_the_api_plans(ui_api):
         assert bar["Laps on the set"] == f"{stint['tire_age_start']} → {stint['tire_age_end']}"
 
     # Laps on the set before the stint and after its last lap: the fitted set's 17 laps plus 8, a new set's 0 plus 16.
-    stints = table(at, "Stint time (s)")
+    stints = table_rows(at, "Stint time (s)")
     assert [row["Laps on the set"] for row in stints] == ["17 → 25", "0 → 16", "0 → 16"]
     stint_frame = next(frame for frame in at.dataframe if "Stint time (s)" in frame.value.columns)
-    assert column_formats(stint_frame) == {
-        name: "%.3f" for name in ("Average lap (s)", "Best lap (s)", "Worst lap (s)", "Stint time (s)")
-    }
-    wear = table(at, "Laps at performance floor")  # the second stint table: tyre performance
+    assert column_formats(stint_frame) == dict.fromkeys(
+        ("Average lap (s)", "Best lap (s)", "Worst lap (s)", "Stint time (s)"), "%.3f"
+    )
+    wear = table_rows(at, "Laps at performance floor")  # the second stint table: tyre performance
     assert [row["Laps past peak window"] for row in wear] == [s["laps_beyond_peak_window"] for s in best["stint_breakdown"]]
     assert wear[0]["Performance start → end"] == (
         f"{best['stint_breakdown'][0]['start_performance']:.4f} → {best['stint_breakdown'][0]['end_performance']:.4f}"
     )
     assert f"Risk label (the API's, set from the number of stops only): {best['risk_level']}." in shown_text(at)
 
-    signals = {row["Driver"]: row["Signal"] for row in table(at, "Signal")}
+    signals = {row["Driver"]: row["Signal"] for row in table_rows(at, "Signal")}
     assert signals == {s["driver_id"]: s["signal"].replace("_", " ") for s in expected["competitor_signals"]}
     assert signals == {"HAM": "undercut target", "VER": "undercut threat"}
-    assert "Explanation" not in table(at, "Signal")[0]  # sentences are listed below the table, not cut off in it
+    assert "Explanation" not in table_rows(at, "Signal")[0]  # sentences are listed below the table, not cut off in it
     for signal in expected["competitor_signals"]:
         assert f"- **{signal['driver_id']}**: {md_text(signal['explanation'])}" in shown_text(at)
     text = shown_text(at)
     for assumption in expected["assumptions"]:
         assert md_text(assumption) in text
-    assert "Accepted but not used in any number" in text
+    assert expected["not_modelled_inputs"]
+    assert "Accepted but not modelled: " + "; ".join(md_text(item) for item in expected["not_modelled_inputs"]) in text
     assert sent_json(at, "strategies") == expected  # the raw response in its expander
 
 
@@ -241,9 +227,9 @@ def test_strategy_plan_details_follow_the_selected_plan(ui_api):
     at = submit(run_page("strategy"), "strategy_submit")
     expected = ui_api.generate_strategy(sent_json(at, "telemetry"))
     second = expected["strategies"][1]
-    at.selectbox(key="strategy_plan_detail").set_value(second["strategy_id"]).run()
+    plan_details(at).set_value(second["strategy_id"]).run()
     assert_no_exception(at)
-    stints = table(at, "Stint time (s)")
+    stints = table_rows(at, "Stint time (s)")
     assert [row["Laps"] for row in stints] == [f"{s['start_lap']}-{s['end_lap']}" for s in second["stint_breakdown"]]
     assert [row["Average lap (s)"] for row in stints] == [s["average_lap_time"] for s in second["stint_breakdown"]]
     assert md_text(second["notes"][0]) in shown_text(at)
@@ -252,7 +238,8 @@ def test_strategy_plan_details_follow_the_selected_plan(ui_api):
 def test_a_new_strategy_result_opens_its_own_recommended_plan(ui_api):
     at = submit(run_page("strategy"), "strategy_submit")
     first = sent_json(at, "strategies")
-    assert at.selectbox(key="strategy_plan_detail").value == first["best_strategy_id"]
+    first_widget = plan_details(at)
+    assert first_widget.value == first["best_strategy_id"]
     at.number_input(key="strategy_current_lap").set_value(40)
     at.slider(key="strategy_brake_wear").set_value(0.0)
     submit(at, "strategy_submit")
@@ -261,8 +248,11 @@ def test_a_new_strategy_result_opens_its_own_recommended_plan(ui_api):
     assert best["strategy_id"] == second["best_strategy_id"] != first["best_strategy_id"]
     # The first result's plan is also in the new list, so a kept choice would still be shown.
     assert first["best_strategy_id"] in [option["strategy_id"] for option in second["strategies"]]
-    assert at.selectbox(key="strategy_plan_detail").value == best["strategy_id"]
-    stints = table(at, "Stint time (s)")
+    # A new widget that starts at the new plan: a browser keeps showing a kept widget's old value, whatever its default.
+    widget = plan_details(at)
+    assert widget.id != first_widget.id
+    assert widget.value == widget.options[widget.proto.default] == best["strategy_id"]
+    stints = table_rows(at, "Stint time (s)")
     assert [row["Laps"] for row in stints] == [f"{s['start_lap']}-{s['end_lap']}" for s in best["stint_breakdown"]]
     assert f"Risk label (the API's, set from the number of stops only): {best['risk_level']}." in shown_text(at)
 
@@ -352,7 +342,7 @@ def test_tyre_rows_that_cannot_be_keyed_are_not_sent(ui_api, table_edits):
         [DEFAULT_TYRE_ROWS[0], DEFAULT_TYRE_ROWS[0], {**DEFAULT_TYRE_ROWS[1], "compound": None}]
     )
     at = submit(run_page("strategy"), "strategy_submit")
-    assert at.error[0].value == "Some inputs could not be read, so nothing was sent to the API:"
+    assert at.error[0].value == "Nothing was sent to the API. Please fix:"
     text = shown_text(at)
     assert f"- {md_text('Tyre model: soft has more than one row; keep one.')}" in text
     assert f"- {md_text('Tyre model, row 3: choose a compound.')}" in text
@@ -363,7 +353,7 @@ def test_unreadable_lap_times_are_not_sent(ui_api):
     at = run_page("strategy")
     at.text_input(key="strategy_lap_times").set_value("95.6, fast, nan")
     submit(at, "strategy_submit")
-    assert at.error[0].value == "Some inputs could not be read, so nothing was sent to the API:"
+    assert at.error[0].value == "Nothing was sent to the API. Please fix:"
     assert "'fast', 'nan' is not a lap time" in shown_text(at)
     assert not at.json and not at.metric
 
@@ -466,7 +456,7 @@ def test_calibration_is_hidden_for_an_api_without_the_endpoint(ui_api, monkeypat
 
 def test_calibration_estimates_the_documented_example_and_fills_the_strategy_form(ui_api):
     at = submit(run_page("strategy"), "calibration_submit")
-    example = openapi_example(ui_api, "TyreCalibrationRequest")
+    example = documented_example(ui_api.get_openapi(), "TyreCalibrationRequest")
     request = sent_json(at, "laps")
     assert request["laps"] == [{key: value for key, value in lap.items() if value is not False} for lap in example["laps"]]
     assert {key: request[key] for key in ("weather", "track_temperature", "pit_stop_delta")} == {
@@ -480,8 +470,8 @@ def test_calibration_estimates_the_documented_example_and_fills_the_strategy_for
     assert shown["Laps excluded"] == str(len(expected["excluded_laps"]))
     assert "synthetic laps generated from the engine's own lap-time model" in shown_text(at)
     # Two narrow tables (fit quality first, then the estimated model) instead of one that is cut off on a desktop.
-    fits = {row["Compound"]: row for row in table(at, "R²")}
-    models = {row["Compound"]: row for row in table(at, "Degradation per lap")}
+    fits = {row["Compound"]: row for row in table_rows(at, "R²")}
+    models = {row["Compound"]: row for row in table_rows(at, "Degradation per lap")}
     assert list(next(iter(fits.values()))) == [
         "Compound",
         "Status",
@@ -503,7 +493,7 @@ def test_calibration_estimates_the_documented_example_and_fills_the_strategy_for
             fit["peak_lap_time_s"],
             fit["initial_degradation_s_per_lap"],
         )
-    assert [row["Reason"] for row in table(at, "Residual (s)")] == [
+    assert [row["Reason"] for row in table_rows(at, "Residual (s)")] == [
         lap["reason"].replace("_", " ") for lap in expected["excluded_laps"]
     ]
 
@@ -571,7 +561,7 @@ def test_calibration_sends_the_fixed_values_table(ui_api, table_edits):
     request = sent_json(at, "laps")
     assert request["peak_window_end"] == {"soft": 5} and request["warm_up_laps"] == {"medium": 0}
     expected = ui_api.calibrate_tyres(request)
-    rows = {row["Compound"]: row for row in table(at, "Degradation per lap")}
+    rows = {row["Compound"]: row for row in table_rows(at, "Degradation per lap")}
     assert expected["compounds"]["soft"]["peak_window_end_source"] == "supplied"
     assert rows["soft"]["Peak window"] == "1-5 (supplied)"
     assert rows["medium"]["Warm-up laps"] == "0 (supplied)"
@@ -595,7 +585,7 @@ def test_calibration_checks_race_laps_and_fixed_values_before_sending(ui_api, ta
     at = run_page("strategy")
     at.number_input(key="calibration_fuel_correction").set_value(0.05)
     submit(at, "calibration_submit")
-    assert at.error[0].value == "Some inputs could not be read, so nothing was sent to the API:"
+    assert at.error[0].value == "Nothing was sent to the API. Please fix:"
     text = shown_text(at)
     # 1-based table rows; the flagged out-lap (row 1) needs no race lap.
     assert md_text("Lap history, rows 3, 4: enter the race lap.") in text
@@ -626,7 +616,7 @@ def test_setup_form_sends_the_documented_example_and_shows_the_api_result(ui_api
     submit(at, "setup_submit")
 
     request = sent_json(at, "track_profile")
-    assert request == openapi_example(ui_api, "SetupRequest")
+    assert request == documented_example(ui_api.get_openapi(), "SetupRequest")
     expected = ui_api.recommend_setup(request)  # deterministic for the same inputs and seed
     assert sent_json(at, "objective_value") == expected
     text = shown_text(at)
@@ -644,7 +634,7 @@ def test_setup_form_sends_the_documented_example_and_shows_the_api_result(ui_api
     for name, value in expected["handling_balance"].items():  # sign kept: > 0 understeer, < 0 oversteer
         assert shown[name.replace("_", " ").capitalize()] == f"{value:+.4f}"
 
-    rows = {row["Parameter"]: row for row in table(at, "Baseline")}
+    rows = {row["Parameter"]: row for row in table_rows(at, "Baseline")}
     assert rows["Ride height"]["Recommended"] == expected["ride_height"]
     assert rows["Ride height"]["Baseline"] == expected["baseline_setup"]["ride_height"]
     assert rows["Differential off throttle"]["Recommended"] == expected["diff_settings"]["coast"]
@@ -658,7 +648,10 @@ def test_setup_form_sends_the_documented_example_and_shows_the_api_result(ui_api
     assert 'The API calls the agreement value "confidence"' in text and "not a probability that the setup is right" in text
     assert md_text(expected["reasoning"]) in text
     assert "**Assumed defaults:** none" in text
-    assert md_text(f"Accepted but not modelled: {', '.join(expected['inputs_not_modelled'])}.") in text
+    # The default form sends humidity but no wind speed, so wind speed is not listed as accepted.
+    assert expected["inputs_not_modelled"] == ["track_profile.track_name (label only)", "weather.humidity"]
+    assert "Accepted but not modelled: " + "; ".join(md_text(item) for item in expected["inputs_not_modelled"]) in text
+    assert "wind_speed" not in text
 
 
 def test_setup_reports_assumed_defaults_and_pinned_values(ui_api):
@@ -672,7 +665,7 @@ def test_setup_reports_assumed_defaults_and_pinned_values(ui_api):
     expected = ui_api.recommend_setup(request)
     assert expected["assumed_defaults"] == ["driver_preferences.risk_tolerance=0.5"]
     assert "**Assumed defaults:** `driver_preferences.risk_tolerance=0.5`" in shown_text(at)
-    row = next(row for row in table(at, "Baseline") if row["Parameter"] == "Front wing angle")
+    row = next(row for row in table_rows(at, "Baseline") if row["Parameter"] == "Front wing angle")
     assert row["Pinned"] and row["Recommended"] == 5.0 == expected["front_wing_angle"]
 
 
@@ -704,7 +697,7 @@ def test_setup_shows_each_new_result_and_never_a_stale_one(ui_api):
     assert second["objective_value"] != first["objective_value"]
     assert sent_json(at, "objective_value") == second
     assert metrics(at)["Objective (lower is better)"] == f"{second['objective_value']:.3f}"
-    rows = {row["Parameter"]: row for row in table(at, "Baseline")}
+    rows = {row["Parameter"]: row for row in table_rows(at, "Baseline")}
     assert rows["Rear wing angle"]["Recommended"] == second["rear_wing_angle"]
 
     at.number_input(key="setup_track_length").set_value(100.0)
@@ -718,7 +711,7 @@ def test_setup_marks_values_at_the_end_of_their_scale(ui_api):
     at.number_input(key="setup_pin_diff_preload").set_value(0.0)
     submit(at, "setup_submit")
     expected = ui_api.recommend_setup(sent_json(at, "track_profile"))
-    rows = {row["Parameter"]: row for row in table(at, "Baseline")}
+    rows = {row["Parameter"]: row for row in table_rows(at, "Baseline")}
     # The engine's documented corner solutions for this track: softest rear bar, stiffest rear springs.
     assert (expected["suspension_settings"]["rear_arb"], expected["suspension_settings"]["rear_spring"]) == (0.0, 100.0)
     assert rows["Rear anti-roll bar"]["Search limit"] == "lowest (0)"
@@ -753,7 +746,7 @@ def test_triage_is_labelled_and_shows_the_api_result(ui_api):
     assert shown["Severity band"] == expected["severity_band"]
     assert shown["Severity score"] == f"{expected['severity_score']:.2f}"
     assert shown["Confidence (input completeness)"] == f"{expected['confidence']:.2f}"
-    assert table(at, "Change") == [
+    assert table_rows(at, "Change") == [
         {"Input": item["source"].replace("_", " "), "Value": str(item["value"]).replace("_", " "), "Change": item["delta"]}
         for item in expected["severity_adjustments"]
     ]
@@ -780,7 +773,7 @@ def test_triage_without_history_and_with_history_adjustments(ui_api):
     assert request["driver_history"] == {"recent_penalties": ["Reprimand", "Time penalty", "Grid drop"], "total_penalties": 12}
     expected = ui_api.predict_penalty(request)
     assert metrics(at)["Severity band"] == expected["severity_band"] == "high"
-    assert [row["Input"] for row in table(at, "Change")] == [
+    assert [row["Input"] for row in table_rows(at, "Change")] == [
         "intent",
         "driver history.recent penalties",
         "driver history.total penalties",
@@ -796,7 +789,7 @@ def test_triage_sends_a_partial_history_and_never_shows_a_stale_result(ui_api):
     assert request["driver_history"] == {"total_penalties": 11}
     expected = ui_api.predict_penalty(request)
     assert metrics(at)["Severity score"] == f"{expected['severity_score']:.2f}"
-    assert "driver history.total penalties" in [row["Input"] for row in table(at, "Change")]
+    assert "driver history.total penalties" in [row["Input"] for row in table_rows(at, "Change")]
 
     at.text_area(key="triage_recent_penalties").set_value("a\nb\nc")
     at.number_input(key="triage_total_penalties").set_value(1)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import os
@@ -17,35 +18,43 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
+from typing import Any, Dict
 
 import httpx
 import pytest
+from pydantic import TypeAdapter
 from streamlit.proto.Block_pb2 import Block
 from streamlit.testing.v1 import AppTest
 
 import app.main
+import core_modules.ghost_car.schemas as ghost_schemas
+import core_modules.llm_query.natural_query as natural_query
 import ui.api_client as api_client
 import ui.components as components
+from core_modules.driver_emotion import emotion_classifier
+from core_modules.rule_checker.fia_rag import RAGSettings, RetrievalConfig
+from core_modules.strategy_optimizer.schemas import CalibrationLapInput
+from core_modules.strategy_optimizer.strategy_engine import WET_WEATHER_COMPOUNDS
 from scripts import run_app
-from tests.helpers import fia_page, write_pdf
-from tests.test_fia_index_retrieval import PIT_LANE
+from tests.helpers import PIT_LANE, fia_page, write_pdf
 from tests.ui_support import (  # noqa: F401 (pytest fixtures)
     ENTRY_POINT,
     REPO_ROOT,
-    VIEWS_DIR,
     assert_no_exception,
     closed_port,
     page_text,
+    record_calls,
     run_page,
+    sidebar_text,
     ui_api,
     ui_api_down,
-    ui_rag,
 )
 from ui.api_client import ApiClient, ApiError, ApiUnavailable, RequestNotSent
 from ui.components import (
     MODULES,
     NAV_SECTIONS,
     PAGES,
+    VIEWS_DIR,
     docs_reference,
     local_time,
     md_text,
@@ -81,16 +90,9 @@ def _next_steps(at: AppTest) -> str:
     return next(element.value for element in at.markdown if element.value.startswith("**Next steps**"))
 
 
-def _counting(monkeypatch, client: ApiClient, method: str) -> list:
-    calls: list = []
-    original = getattr(client, method)
-    monkeypatch.setattr(client, method, lambda *args: calls.append(1) or original(*args))
-    return calls
-
-
 @pytest.fixture(autouse=True)
-def _no_api_url_from_the_environment(monkeypatch):
-    monkeypatch.delenv("F1_API_URL", raising=False)
+def _fresh_client():
+    # Tests here create the shared client or install overrides directly, without the ui_api fixtures.
     api_client._shared_client.cache_clear()
     yield
     api_client.clear_client_override()
@@ -130,7 +132,6 @@ def stand_in_api():
 
 
 def test_client_returns_the_api_json(ui_api):
-    assert ui_api.root()["docs"] == "/docs"
     assert ui_api.health()["modules"]["strategy"] == "ready"
     body = ui_api.predict_penalty(TRIAGE_REQUEST)
     assert body["method"] == "transparent heuristic triage" and body["referenced_rule"] is None
@@ -172,6 +173,10 @@ def test_error_body_parsing_edge_cases():
                 "msg": "Input should be a finite number", "input": "nan",
             },
             {"type": "json_invalid", "loc": ["body"], "msg": "JSON decode error", "input": None},
+            {  # a model validator's own message, without pydantic's prefix
+                "type": "value_error", "loc": ["body", "race_state"],
+                "msg": "Value error, current_lap (99) must be <= total_laps (57)", "input": "<object with 8 keys>",
+            },
         ],
         "more_errors": 3,
     }  # fmt: skip
@@ -182,6 +187,7 @@ def test_error_body_parsing_edge_cases():
         "race_state.total_laps: Field required",
         "telemetry.lap_times[2]: Input should be a finite number (got 'nan')",
         "request body: JSON decode error",
+        "race_state: current_lap (99) must be <= total_laps (57)",
         "... and 3 more",
     ]
     proxy = _mock_client(lambda request: httpx.Response(502, text="<html>\n  Bad   gateway</html>"))
@@ -204,7 +210,7 @@ def test_another_json_service_on_the_api_port_does_not_break_the_ui():
     api_client.set_client_override(_mock_client(lambda request: httpx.Response(200, json=["ok"])))
     at = run_page(ENTRY_POINT)
     assert_no_exception(at)
-    sidebar = "\n".join(str(element.value) for element in [*at.sidebar.markdown, *at.sidebar.caption])
+    sidebar = sidebar_text(at, captions=True)
     assert ":red-badge[unreachable] API status" in sidebar and "did not return a JSON object" in sidebar
 
 
@@ -288,7 +294,7 @@ def test_proxy_settings_from_the_environment_are_ignored(stand_in_api, monkeypat
     monkeypatch.setenv("F1_API_URL", url)
     at = run_page(ENTRY_POINT)
     assert_no_exception(at)
-    assert ":green-badge[healthy] API 9.9.9" in "\n".join(str(element.value) for element in at.sidebar.markdown)
+    assert ":green-badge[healthy] API 9.9.9" in sidebar_text(at)
 
 
 def test_credentials_in_the_api_url_are_sent_but_never_shown(stand_in_api, monkeypatch):
@@ -361,7 +367,7 @@ def _read_schema_twice():
 
 
 def test_the_openapi_document_is_fetched_once_per_session(ui_api, monkeypatch):
-    calls = _counting(monkeypatch, ui_api, "get_openapi")
+    calls = record_calls(monkeypatch, ui_api, "get_openapi")
     at = AppTest.from_function(_read_schema_twice, default_timeout=30).run()
     assert_no_exception(at)
     at.run()
@@ -401,6 +407,33 @@ def test_md_text_shows_api_text_literally_but_keeps_code_spans():
         "a\\_b \\*c\\* \\[S1\\] \\<project\\> `python scripts/build_fia_index.py`"
     )
     assert md_text("unbalanced ` tick_x") == "unbalanced \\` tick\\_x"
+    # A model answer keeps its bold and italics, but still no links, HTML or directives.
+    assert md_text("**80km/h** in _all_ [the PDF](https://x) `a_b`", keep_emphasis=True) == (
+        "**80km/h** in _all_ \\[the PDF\\](https\\://x) `a_b`"
+    )
+
+
+def test_passage_links_are_plain_http_urls_opened_at_the_page():
+    passage = {"source_url": "https://www.fia.com/section_b.pdf", "page": 3}
+    assert components.pdf_link(passage) == "https://www.fia.com/section_b.pdf#page=3"
+    assert components.pdf_link({"source_url": "http://www.fia.com/b.pdf", "page": None}) == "http://www.fia.com/b.pdf"
+    # source_url comes from the user-editable manifest: nothing that could break out of a Markdown link.
+    for unsafe in (
+        "javascript:alert(1)", "ftp://x/a.pdf", "https://x/a b.pdf", "https://x/a).pdf", "https://x/`y`.pdf",
+        "https://x/a[1].pdf", 'https://x/"a".pdf', "https://x/<a>.pdf", None, 5,
+    ):  # fmt: skip
+        assert components.pdf_link({"source_url": unsafe, "page": 1}) is None, unsafe
+
+
+def test_one_decline_explanation_per_documented_reason(ui_api):
+    documented = ui_api.get_openapi()["components"]["schemas"]["FIAAnswerResponse"]["properties"]["decline_reason"]
+    assert set(components.DECLINE_REASONS) == {reason.strip() for reason in documented["description"].split("|")}
+    # A reason code of a newer API is named as unknown, not explained with a guess.
+    assert components.decline_explanation("new_reason") == (
+        "The API declined to answer",
+        "This UI does not know the reason code; the raw API response has the details.",
+        "",
+    )
 
 
 def _render_errors():
@@ -442,29 +475,19 @@ def test_api_errors_are_explained_with_next_steps():
     assert captions[-1] == "health cache cleared: True"
 
 
-def _render_more_errors():
-    from ui.api_client import ApiError, RequestNotSent
+def _render_unsent_request():
+    from ui.api_client import RequestNotSent
     from ui.components import show_api_error
 
     show_api_error(RequestNotSent("it contains a number JSON cannot carry (inf)"), "The question")
-    pydantic_text = (
-        "1 validation error for StrategyRequest\nrace_state\n  Value error, current_lap (99) must be <= total_laps (57) "
-        "[type=value_error, input_value={...}, input_type=dict]\n    For further information visit "
-        "https://errors.pydantic.dev/2.11/v/value_error"
-    )
-    show_api_error(ApiError(422, pydantic_text), "The question")
 
 
-def test_unsent_requests_and_plain_text_validation_errors_are_readable():
-    at = AppTest.from_function(_render_more_errors, default_timeout=30).run()
+def test_an_unsent_request_is_readable():
+    at = AppTest.from_function(_render_unsent_request, default_timeout=30).run()
     assert_no_exception(at)
     reason = "the request could not be encoded as JSON: it contains a number JSON cannot carry (inf)"
     assert at.error[0].value == f"The question was not sent: {md_text(reason)}."
     assert at.caption[0].value == "Correct that value and submit again."
-    assert at.error[1].value == "The question was rejected by the API (HTTP 422):"
-    # One line per error, without pydantic's type codes and documentation links.
-    assert at.markdown[0].value == "- " + md_text("race_state: current_lap (99) must be <= total_laps (57)")
-    assert components.validation_lines("Model provider failed\nline two") == []  # any other text is kept as it is
 
 
 def test_field_labels_use_the_form_words():
@@ -477,7 +500,7 @@ def test_field_labels_use_the_form_words():
     assert fields.label("tire_data.hard.peak_performance_window[1]") == "Tyre model › hard › Window end"
     assert fields.label("competition[0].tire_age") == "Competitors › row 1 › Tyre age"
     assert fields.label("telemetry.lap_times[2]") == "Telemetry › Recent lap times › entry 3"
-    assert fields.message("Value error, tire_data has no compound usable in wet") == "Tyre model has no compound usable in wet"
+    assert fields.message("tire_data has no compound usable in wet") == "Tyre model has no compound usable in wet"
     assert fields.errors(
         [
             "competition[1].tire_age: Input should be >= 0 (got -1)",
@@ -497,10 +520,10 @@ def test_tied_emotion_profiles_are_named():
     tied = {"calm": 1.0, "angry": 0.628, "focused": 1.0}
     assert components.tied_profiles(tied) == ["calm", "focused"]
     assert components.tied_profiles({"calm": 0.754, "focused": 0.752}) == [] and components.tied_profiles({}) == []
-    note = components.profile_tie_note(tied, "calm")
-    assert note.startswith("**Tied profiles:** calm and focused both score 1.000, so the audio does not separate them.")
-    three = components.profile_tie_note({"calm": 0.9, "focused": 0.9, "excited": 0.9}, "calm")
-    assert "calm, focused and excited all score 0.900" in three
+    note = components.profile_tie_note(tied, "neutral")
+    assert note.startswith("**Tied profiles:** calm and focused both score 1.000, so the audio does not separate them:")
+    three = components.profile_tie_note({"calm": 0.9, "focused": 0.9, "excited": 0.9}, "neutral")
+    assert three.startswith("**Tied profiles:** calm, focused and excited all score 0.900, so the audio does not separate them:")
     # The API reports an exact tie for the best profile as neutral with confidence 0; the note says why.
     assert components.profile_tie_note({"calm": 0.3, "focused": 0.3}, "neutral") == (
         "**Tied profiles:** calm and focused both score 0.300, so the audio does not separate them: the acoustic "
@@ -532,8 +555,8 @@ def _break_the_provider(rag, monkeypatch) -> None:
     monkeypatch.setattr(rag.embedder()._embeddings, "embed_query", unreachable)
 
 
-def test_real_provider_failure_is_not_called_a_missing_index(ui_api, ui_rag, monkeypatch):
-    rag, _ = ui_rag
+def test_real_provider_failure_is_not_called_a_missing_index(ui_api, installed_rag, monkeypatch):
+    rag, _ = installed_rag
     rag.build_index()
     _break_the_provider(rag, monkeypatch)
     with pytest.raises(ApiError) as caught:
@@ -551,7 +574,7 @@ def test_health_snapshots_expire(ui_api, ui_api_down, monkeypatch):
     monkeypatch.setattr(components, "time", clock)
     for client, ttl in ((ui_api, components.HEALTH_TTL_S), (ui_api_down, components.FAILED_HEALTH_TTL_S)):
         api_client.set_client_override(client)
-        calls = _counting(monkeypatch, client, "health")
+        calls = record_calls(monkeypatch, client, "health")
         at = run_page("overview")
         at.run()
         assert len(calls) == 1
@@ -647,8 +670,8 @@ def test_overview_asks_only_for_what_is_missing(ui_api, monkeypatch):
     assert "Download the official PDFs" in text and "Set `OPENAI_API_KEY`" not in text
 
 
-def test_overview_reports_a_ready_index_without_calling_the_model(ui_api, ui_rag):
-    rag, llm = ui_rag
+def test_overview_reports_a_ready_index_without_calling_the_model(ui_api, installed_rag):
+    rag, llm = installed_rag
     rag.build_index()
     points = rag.status()["index"]["points"]
     at = run_page("overview")
@@ -662,7 +685,7 @@ def test_overview_reports_a_ready_index_without_calling_the_model(ui_api, ui_rag
     assert llm.calls == []
 
 
-def test_overview_gives_the_build_command_for_a_missing_index(ui_api, ui_rag):
+def test_overview_gives_the_build_command_for_a_missing_index(ui_api, installed_rag):
     at = run_page("overview")
     assert_no_exception(at)
     text = page_text(at)
@@ -674,8 +697,8 @@ def test_overview_gives_the_build_command_for_a_missing_index(ui_api, ui_rag):
     assert "docker compose" not in text and "Documents: 2" in text
 
 
-def test_overview_explains_a_stale_index(ui_api, ui_rag):
-    rag, _ = ui_rag
+def test_overview_explains_a_stale_index(ui_api, installed_rag):
+    rag, _ = installed_rag
     rag.build_index()
     write_pdf(rag.settings.docs_path / "section_d_financial.pdf", [fia_page(1, PIT_LANE)])
     at = run_page("overview")
@@ -694,8 +717,8 @@ def test_overview_explains_a_misconfigured_rag(ui_api, monkeypatch):
     assert "Correct the setting named above in `.env` or the environment, then restart the API" in text
 
 
-def test_overview_explains_a_failing_provider(ui_api, ui_rag, monkeypatch):
-    rag, llm = ui_rag
+def test_overview_explains_a_failing_provider(ui_api, installed_rag, monkeypatch):
+    rag, llm = installed_rag
     rag.build_index()
     _break_the_provider(rag, monkeypatch)
     with pytest.raises(ApiError):
@@ -721,16 +744,16 @@ def test_overview_notes_unwritable_artifacts_and_missing_transcription(ui_api, m
     assert "Radio transcription is optional and unavailable on this API: openai-whisper is not installed" in text
 
 
-def test_overview_never_contradicts_itself_after_the_index_changes(ui_api, ui_rag, monkeypatch):
-    rag, _ = ui_rag
-    calls = _counting(monkeypatch, ui_api, "health")
+def test_overview_never_contradicts_itself_after_the_index_changes(ui_api, installed_rag, monkeypatch):
+    rag, _ = installed_rag
+    calls = record_calls(monkeypatch, ui_api, "health")
     at = run_page(ENTRY_POINT)
     assert_no_exception(at)
-    assert ":red-badge[index missing] FIA regulation QA" in "\n".join(m.value for m in at.sidebar.markdown)
+    assert ":red-badge[index missing] FIA regulation QA" in sidebar_text(at)
     rag.build_index()  # within the 30 s health cache
     at.run()
     assert_no_exception(at)
-    sidebar = "\n".join(str(element.value) for element in at.sidebar.markdown)
+    sidebar = sidebar_text(at)
     main = page_text(at)
     assert ":green-badge[ready] FIA regulation QA" in sidebar and "index missing" not in sidebar
     assert ":green-badge[ready] FIA regulation QA" in main and ":green-badge[ready] Regulation QA" in main
@@ -740,7 +763,7 @@ def test_overview_never_contradicts_itself_after_the_index_changes(ui_api, ui_ra
 
 
 def test_overview_refreshes_a_disagreeing_status_only_once(ui_api, monkeypatch):
-    calls = _counting(monkeypatch, ui_api, "health")
+    calls = record_calls(monkeypatch, ui_api, "health")
     status = ui_api.fia_status()
     monkeypatch.setattr(ui_api, "fia_status", lambda: {**status, "state": "index_missing"})  # never matches /health
     at = run_page("overview", timeout=15)
@@ -749,7 +772,7 @@ def test_overview_refreshes_a_disagreeing_status_only_once(ui_api, monkeypatch):
 
 
 def test_overview_when_the_api_is_down(ui_api_down, monkeypatch):
-    attempts = _counting(monkeypatch, ui_api_down, "health")
+    attempts = record_calls(monkeypatch, ui_api_down, "health")
     at = run_page("overview")
     at.run()
     assert_no_exception(at)
@@ -762,7 +785,7 @@ def test_overview_when_the_api_is_down(ui_api_down, monkeypatch):
 
 
 def test_overview_caches_health_per_session_and_refreshes_on_demand(ui_api, monkeypatch):
-    calls = _counting(monkeypatch, ui_api, "health")
+    calls = record_calls(monkeypatch, ui_api, "health")
     at = run_page("overview")
     at.run()
     assert len(calls) == 1
@@ -847,7 +870,7 @@ def test_entry_point_runs_every_page_with_the_status_sidebar(ui_api):
     at = run_page(ENTRY_POINT)
     assert_no_exception(at)
     assert at.title[0].value == "F1 AI Copilot"  # the default page is the overview
-    sidebar = "\n".join(str(element.value) for element in at.sidebar.markdown)
+    sidebar = sidebar_text(at)
     assert at.sidebar.code[0].value == "http://testserver"
     assert ":orange-badge[degraded] API" in sidebar and ":red-badge[not configured] FIA regulation QA" in sidebar
     for name in PAGES:
@@ -872,7 +895,7 @@ def test_entry_point_explains_a_malformed_api_url(monkeypatch):
 def test_sidebar_shows_an_unreachable_api(ui_api_down):
     at = run_page(ENTRY_POINT)
     assert_no_exception(at)
-    sidebar = "\n".join(str(element.value) for element in [*at.sidebar.markdown, *at.sidebar.caption])
+    sidebar = sidebar_text(at, captions=True)
     assert ":red-badge[unreachable] API status" in sidebar and "Status check failed: connection failed" in sidebar
 
 
@@ -889,6 +912,64 @@ def test_streamlit_settings_sit_next_to_the_entry_point():
     config = tomllib.loads((ENTRY_POINT.parent / ".streamlit" / "config.toml").read_text())
     assert config["server"]["address"] == "127.0.0.1" and config["browser"]["gatherUsageStats"] is False
     assert config["server"]["maxUploadSize"] == 20
+
+
+def _page_constants(page: str) -> Dict[str, Any]:
+    """A page's module-level constants, read from its source (importing a page script would run the page).
+
+    A compiled pattern is given as its pattern text.
+    """
+
+    constants: Dict[str, Any] = {}
+    for node in ast.parse((REPO_ROOT / "ui" / "views" / f"{page}.py").read_text(encoding="utf-8")).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target, value = node.targets[0], node.value
+        if isinstance(value, ast.Call) and ast.unparse(value.func) == "re.compile":
+            value = value.args[0]
+        try:
+            literal = ast.literal_eval(value)
+        except ValueError:
+            continue
+        if isinstance(target, ast.Tuple):
+            constants.update(zip((name.id for name in target.elts), literal, strict=True))
+        elif isinstance(target, ast.Name):
+            constants[target.id] = literal
+    return constants
+
+
+def test_the_ui_copies_of_api_limits_match_the_api():
+    # The UI checks these before sending (the API checks again); a copy that drifts would refuse valid input.
+    ghost = _page_constants("ghost")
+    assert (ghost["MIN_SAMPLES"], ghost["MAX_SAMPLES"], ghost["MAX_SPEED_KMH"]) == (
+        ghost_schemas.MIN_SAMPLES, ghost_schemas.MAX_SAMPLES, ghost_schemas.MAX_SPEED_KMH,
+    )  # fmt: skip
+    assert ghost["MAX_GEAR"] == TypeAdapter(ghost_schemas.Gear).json_schema()["maximum"]
+    assert f"^{ghost['TRACK_SECTION_PATTERN']}$" == ghost_schemas.TRACK_SECTION_PATTERN  # used with fullmatch
+    assert _page_constants("assistant")["MAX_QUERY_CHARS"] == natural_query.MAX_QUERY_CHARS
+    regulations = _page_constants("regulations")
+    assert (regulations["MAX_QUESTION_CHARS"], regulations["MAX_TOP_K"]) == (
+        app.main.MAX_QUESTION_CHARS, RetrievalConfig.MAX_TOP_K,
+    )  # fmt: skip
+    flags = {name for name, field in CalibrationLapInput.model_fields.items() if field.annotation is bool}
+    assert set(_page_constants("strategy")["LAP_FLAGS"]) == flags == {"pit_out", "pit_in", "safety_car"}
+    assert components.MAX_AUDIO_BYTES == emotion_classifier.MAX_AUDIO_BYTES
+    assert RAGSettings().docs_path == REPO_ROOT / components.DEFAULT_DOCS_PATH
+
+
+def test_the_ui_copies_of_api_choices_match_the_api():
+    # A select box offering a value the API refuses, or missing one it accepts, would go unnoticed otherwise.
+    schemas = app.main.app.openapi()["components"]["schemas"]
+    setup, triage, strategy = (_page_constants(page) for page in ("setup", "triage", "strategy"))
+    for choices, enum in (
+        (setup["TRACK_TYPES"], "TrackType"), (setup["CONDITIONS"], "WeatherCondition"),
+        (triage["INCIDENT_TYPES"], "IncidentType"), (triage["TRACK_CONDITIONS"], "TrackCondition"),
+        (triage["INTENTS"], "Intent"), (strategy["COMPOUNDS"], "TireCompound"), (strategy["WEATHER"], "WeatherCondition"),
+    ):  # fmt: skip
+        assert sorted(choices) == sorted(schemas[enum]["enum"]), enum  # a page may order the choices its own way
+    assert set(strategy["WET_COMPOUNDS"]) == {compound.value for compound in WET_WEATHER_COMPOUNDS}
+    assert set(_page_constants("ghost")["OPTIONAL_CHANNELS"]) == set(ghost_schemas.ALL_OPTIONAL_CHANNELS)
+    assert _page_constants("radio")["PROFILE_FEATURES"] == emotion_classifier.EmotionClassifier.REQUIRED_FEATURES
 
 
 # ------------------------------------------------------------------ launcher

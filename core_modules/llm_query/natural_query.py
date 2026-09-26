@@ -50,7 +50,6 @@ decision rule used) so that a routing decision can always be inspected.
 import math
 import numbers
 import re
-import threading
 import unicodedata
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -191,8 +190,8 @@ PATTERN_TERMS: Tuple[Tuple[str, QueryType, int, str], ...] = (
 
 
 def _weighted(cues: Sequence[str], topics: Sequence[str]) -> Dict[str, int]:
-    terms = {term: CUE for term in cues}
-    terms.update({term: TOPIC for term in topics})
+    terms = dict.fromkeys(cues, CUE)
+    terms.update(dict.fromkeys(topics, TOPIC))
     return terms
 
 
@@ -257,7 +256,7 @@ def _build_terms() -> Tuple[_Term, ...]:
 
 
 _TERMS = _build_terms()
-_DASHES = str.maketrans({dash: "-" for dash in "‐‑‒–—―−"})
+_DASHES = str.maketrans(dict.fromkeys("‐‑‒–—―−", "-"))
 
 
 def normalise_query_text(text: str) -> str:
@@ -665,9 +664,6 @@ class NaturalQueryProcessor:
     requests.
     """
 
-    def __init__(self):
-        self.vocabulary = VOCABULARY
-
     def process_natural_query(self, query: str, context: Optional[Dict[str, Any]] = None) -> QueryResult:
         if not isinstance(query, str):
             raise ValueError("query must be a string")
@@ -692,12 +688,6 @@ class NaturalQueryProcessor:
         }
         result = handlers[decision.query_type](query, context)
         return replace(result, routing=decision.to_dict())
-
-    def classify_query(self, query: str, context: Optional[Mapping[str, Any]] = None) -> RoutingDecision:
-        return classify_query(query, context)
-
-    def _classify_query(self, query: str, context: Optional[Mapping[str, Any]] = None) -> QueryType:
-        return classify_query(query, context).query_type
 
     def _handle_performance_query(self, query: str, context: Dict[str, Any]) -> QueryResult:
         """Restate supplied telemetry values; never infer or invent missing ones.
@@ -939,13 +929,11 @@ class NaturalQueryProcessor:
 
         from core_modules.driver_emotion.emotion_classifier import classify_emotion_detailed
 
-        result = classify_emotion_detailed(str(audio), transcribe=transcribe, allow_local_paths=False)
-        raw_confidence = result.get("confidence")
-        confidence = None if raw_confidence is None else float(raw_confidence)
-        classifier = result.get("classifier") or "acoustic heuristic"
-        score_text = "no score" if confidence is None else f"heuristic score {confidence:.2f}, not a calibrated probability"
+        result = classify_emotion_detailed(audio, transcribe=transcribe, allow_local_paths=False)
+        confidence = result["confidence"]
         return QueryResult(
-            f"The {classifier} classifier labelled the clip '{result['emotion']}' ({score_text}).",
+            f"The {result['classifier']} classifier labelled the clip '{result['emotion']}' "
+            f"(heuristic score {confidence:.2f}, not a calibrated probability).",
             QueryType.EMOTION,
             confidence,
             ["driver_emotion"],
@@ -962,20 +950,11 @@ class NaturalQueryProcessor:
         )
 
 
-_query_processor: Optional[NaturalQueryProcessor] = None
-_query_processor_lock = threading.Lock()
-
-
-def get_query_processor() -> NaturalQueryProcessor:
-    global _query_processor
-    with _query_processor_lock:
-        if _query_processor is None:
-            _query_processor = NaturalQueryProcessor()
-        return _query_processor
+_query_processor = NaturalQueryProcessor()
 
 
 def process_natural_query(query: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    result = get_query_processor().process_natural_query(query, context)
+    result = _query_processor.process_natural_query(query, context)
     return {
         "answer": result.answer,
         "query_type": result.query_type.value,

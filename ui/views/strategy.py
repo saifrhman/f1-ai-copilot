@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 import re
-import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import altair as alt
@@ -18,15 +17,24 @@ import streamlit as st
 
 from ui.api_client import CALIBRATE_TYRES_PATH, ApiError, ApiUnavailable, get_client
 from ui.components import (
+    KEEP,
     FieldLabels,
     api_schema,
+    clock_time,
     documented_example,
     example_inputs_badge,
     heuristic_badge,
+    humanise,
     json_expander,
     md_text,
+    not_modelled_text,
     offers_endpoint,
+    render_form_outcome,
+    round4,
+    seed_form,
+    show_input_problems,
     show_request_error,
+    submit_form,
     unchanged_example,
 )
 
@@ -94,7 +102,6 @@ OVERRIDE_COLUMNS = ("compound", "peak_window_end", "warm_up_laps")
 WET_COMPOUNDS = ("intermediate", "wet")  # the only tyres a stop can fit when the weather is not dry
 RULE_VIOLATED, RULE_UNVERIFIED = "violated", "unverified"  # two_compound_rule values that need a warning
 
-KEEP = "session"  # form values survive page switches (persist_state)
 NOTICE_KEY = "strategy_notice"
 REMOVED_NOTICE_KEY = "strategy_removed_compounds_notice"
 OUTCOME_KEY = "strategy_outcome"
@@ -127,11 +134,6 @@ FIELDS = FieldLabels(
 
 
 # ------------------------------------------------------------------ input helpers
-
-
-def show_input_problems(problems: Sequence[str]) -> None:
-    st.error("Some inputs could not be read, so nothing was sent to the API:", icon=":material/edit_note:")
-    st.markdown("\n".join(f"- {md_text(problem)}" for problem in problems))
 
 
 def add_problem(problems: List[str], problem: str) -> None:
@@ -211,10 +213,6 @@ def parse_lap_times(text: str) -> Tuple[List[float], List[str]]:
         else:
             unreadable.append(token)
     return values, unreadable
-
-
-def optional(value: Optional[float]) -> Optional[float]:
-    return None if value is None else round(float(value), 4)
 
 
 def text_width(values: Sequence[str]) -> int:
@@ -297,7 +295,7 @@ def build_request(tyres: pd.DataFrame, rivals: pd.DataFrame) -> Tuple[Dict[str, 
         ("throttle_aggressiveness", "strategy_measured_throttle"),
     ):
         if state[key] is not None:
-            telemetry[field] = optional(state[key])
+            telemetry[field] = round4(state[key])
     race_state: Dict[str, Any] = {
         "current_lap": state["strategy_current_lap"],
         "total_laps": state["strategy_total_laps"],
@@ -310,16 +308,16 @@ def build_request(tyres: pd.DataFrame, rivals: pd.DataFrame) -> Tuple[Dict[str, 
     if state["strategy_history_known"]:
         race_state["used_compounds"] = list(state["strategy_used_compounds"])
     if state["strategy_own_gap"] is not None:
-        race_state["own_gap_to_leader"] = optional(state["strategy_own_gap"])
+        race_state["own_gap_to_leader"] = round4(state["strategy_own_gap"])
     request = {
         "telemetry": telemetry,
         "car_status": {
-            "engine_wear": optional(state["strategy_engine_wear"]),
-            "brake_wear": optional(state["strategy_brake_wear"]),
-            "damage": {part: optional(state[f"strategy_{part}"]) for part in ("front_wing", "floor", "diffuser")},
+            "engine_wear": round4(state["strategy_engine_wear"]),
+            "brake_wear": round4(state["strategy_brake_wear"]),
+            "damage": {part: round4(state[f"strategy_{part}"]) for part in ("front_wing", "floor", "diffuser")},
         },
         "driver_profile": {
-            name: optional(state[f"strategy_{name}"])
+            name: round4(state[f"strategy_{name}"])
             for name in ("tire_management", "risk_tolerance", "braking_consistency", "throttle_aggressiveness")
         },
         "tire_data": tyre_model(tyres, problems),
@@ -619,7 +617,7 @@ def render_strategy(outcome: Mapping[str, Any]) -> None:
         example_inputs_badge()
     st.caption(
         f"{md_text(body.get('method', ''))} Result for the request sent at "
-        f"{time.strftime('%H:%M:%S', time.localtime(outcome['at']))}."
+        f"{clock_time(outcome['at'])}."
     )
     if best is None:
         st.warning("The API response contains no ranked plan.", icon=":material/help:")
@@ -671,7 +669,7 @@ def render_strategy(outcome: Mapping[str, Any]) -> None:
             for option in strategies
         ],
         hide_index=True,
-        column_config={name: seconds for name in ("Projected (s)", "Gap to best (s)", "Pit loss (s)")}
+        column_config=dict.fromkeys(("Projected (s)", "Gap to best (s)", "Pit loss (s)"), seconds)
         | {"Plan": st.column_config.TextColumn(width=text_width([option["strategy_id"] for option in strategies]))},
     )
     if all(option.get("stint_breakdown") for option in strategies):
@@ -679,8 +677,12 @@ def render_strategy(outcome: Mapping[str, Any]) -> None:
         st.caption("Stints per plan; the gaps are pit stops. Hover a stint for its lap range, laps on the set and lap times.")
 
     plans = [option["strategy_id"] for option in strategies]
-    chosen = st.selectbox(  # a new result starts at its recommended plan (the page drops the old choice)
-        "Plan details", plans, index=plans.index(best["strategy_id"]), key=PLAN_DETAIL_KEY, help="Stints and notes of one plan."
+    chosen = st.selectbox(  # a new widget for every result, so the browser also starts at its recommended plan
+        "Plan details",
+        plans,
+        index=plans.index(best["strategy_id"]),
+        key=f"{PLAN_DETAIL_KEY}_{outcome['at']}",
+        help="Stints and notes of one plan.",
     )
     option = strategies[plans.index(chosen)] if chosen in plans else best
     stints = option.get("stint_breakdown") or []
@@ -703,7 +705,7 @@ def render_strategy(outcome: Mapping[str, Any]) -> None:
             for stint in stints
         ],
         hide_index=True,
-        column_config={name: seconds for name in ("Average lap (s)", "Best lap (s)", "Worst lap (s)", "Stint time (s)")}
+        column_config=dict.fromkeys(("Average lap (s)", "Best lap (s)", "Worst lap (s)", "Stint time (s)"), seconds)
         | {
             "Laps on the set": st.column_config.TextColumn(
                 help="Laps already run on this set when the stint starts → after its last lap."
@@ -735,7 +737,7 @@ def render_strategy(outcome: Mapping[str, Any]) -> None:
     )
     columns[3].metric(
         "Tyre state",
-        str(body.get("tire_state", "")).replace("_", " "),
+        humanise(body.get("tire_state", "")),
         help="supplied: the fitted set continues; assumed fresh: no fitted set was given.",
     )
 
@@ -744,7 +746,7 @@ def render_strategy(outcome: Mapping[str, Any]) -> None:
     if signals:
         st.dataframe(
             [
-                {"Driver": s["driver_id"], "Signal": s["signal"].replace("_", " "), "Gap (s)": s["gap_s"],
+                {"Driver": s["driver_id"], "Signal": humanise(s["signal"]), "Gap (s)": s["gap_s"],
                  "Compound": s["tire_compound"], "Tyre age": s["tire_age"]}
                 for s in signals
             ],
@@ -759,7 +761,7 @@ def render_strategy(outcome: Mapping[str, Any]) -> None:
     st.markdown("\n".join(f"- {md_text(item)}" for item in body.get("assumptions") or []))
     not_modelled = body.get("not_modelled_inputs") or []
     if not_modelled:
-        st.caption("Accepted but not used in any number: " + "; ".join(md_text(item) for item in not_modelled))
+        st.caption(not_modelled_text(not_modelled))
     search = body.get("search") or {}
     if search:
         st.caption(
@@ -773,18 +775,16 @@ def render_outcome(outcome: Mapping[str, Any]) -> None:
     if outcome.get("problems"):
         show_input_problems(outcome["problems"])
         return
-    error = outcome.get("error")
-    if error is not None:
-        show_request_error(error, "The strategy request", FIELDS)
-        engine_refusal = isinstance(error, ApiError) and error.status_code == 422 and not error.errors
-        hint = wet_tyre_hint(outcome["request"]) if engine_refusal else None
-        if hint:
-            st.info(hint, icon=":material/water_drop:")
-    else:
-        render_strategy(outcome)
-    json_expander(outcome["request"], "Request sent to the API")
-    if outcome.get("response") is not None:
-        json_expander(outcome["response"])
+
+    def explain_refusal(error: Any) -> None:
+        """Why the engine refused the request (a 422 that names no field), when it is a wet race without wet tyres."""
+
+        if isinstance(error, ApiError) and error.status_code == 422 and not error.errors:
+            hint = wet_tyre_hint(outcome["request"])
+            if hint:
+                st.info(hint, icon=":material/water_drop:")
+
+    render_form_outcome(outcome, "The strategy request", FIELDS, render_strategy, explain_refusal)
 
 
 # ------------------------------------------------------------------ tyre calibration (optional endpoint)
@@ -837,7 +837,7 @@ def calibration_request(laps: pd.DataFrame, overrides: pd.DataFrame) -> Tuple[Di
         ("fuel_correction_s_per_lap", "calibration_fuel_correction"),
     ):
         if state[key] is not None:
-            request[field] = optional(state[key])
+            request[field] = round4(state[key])
     if request.get("fuel_correction_s_per_lap"):
         missing = [number for number, row in rows if row["race_lap"] is None and not any(row[flag] for flag in LAP_FLAGS)]
         if missing:
@@ -891,6 +891,7 @@ def render_calibration_result(outcome: Mapping[str, Any]) -> None:
         return
     if outcome.get("error") is not None:
         show_request_error(outcome["error"], "The calibration request", FIELDS)
+        st.caption("Request sent to the API")  # inside the calibration expander, so not in an expander of its own
         st.json(outcome["request"], expanded=False)
         return
     body = outcome["response"]
@@ -920,12 +921,12 @@ def render_calibration_result(outcome: Mapping[str, Any]) -> None:
             tire = entry.get("tire_data") or {}
             fit = entry.get("fit") or {}
             window = tire.get("peak_performance_window")
-            warm_up_source = str(entry.get("warm_up_source", "")).replace("_", " ")
-            window_source = str(entry.get("peak_window_end_source", "")).replace("_", " ")
+            warm_up_source = humanise(entry.get("warm_up_source", ""))
+            window_source = humanise(entry.get("peak_window_end_source", ""))
             laps = " / ".join(str(entry.get(name)) for name in ("laps_used", "clean_laps", "laps_supplied"))
             fits.append({
                 "Compound": compound,
-                "Status": str(entry.get("status", "")).replace("_", " "),
+                "Status": humanise(entry.get("status", "")),
                 "R²": fit.get("r_squared"),
                 "Residual SD (s)": fit.get("residual_std_s"),
                 "Laps used / clean / supplied": laps,
@@ -975,7 +976,7 @@ def render_calibration_result(outcome: Mapping[str, Any]) -> None:
             st.dataframe(
                 [
                     {"Row": lap["index"] + 1, "Compound": lap["compound"], "Tyre age": lap["tire_age"],
-                     "Lap time (s)": lap["lap_time"], "Reason": lap["reason"].replace("_", " "),
+                     "Lap time (s)": lap["lap_time"], "Reason": humanise(lap["reason"]),
                      "Fitted lap time (s)": lap.get("fitted_lap_time"), "Residual (s)": lap.get("residual_s")}
                     for lap in excluded
                 ],
@@ -1108,12 +1109,7 @@ def render_calibration() -> None:
             keep_table("calibration_laps", [row for _, row in table_rows(laps, LAP_COLUMNS)])
             keep_table("calibration_overrides", [row for _, row in table_rows(overrides, OVERRIDE_COLUMNS)])
             request, problems = calibration_request(laps, overrides)
-            outcome = {"request": request, "problems": problems, "response": None, "error": None}
-            if not problems:
-                try:
-                    outcome["response"] = get_client().calibrate_tyres(request)
-                except (ApiUnavailable, ApiError) as exc:
-                    outcome["error"] = exc
+            outcome = submit_form(request, get_client().calibrate_tyres, example=False, problems=problems)
             st.session_state[CALIBRATION_KEY] = outcome
         if outcome is not None:
             render_calibration_result(outcome)
@@ -1129,8 +1125,7 @@ st.caption(
     "sequence with up to 3 stops. It is not a calibrated race simulator; fuel, traffic, safety cars and weather "
     "changes are not modelled."
 )
-for widget_key, default in FORM_DEFAULTS.items():
-    st.session_state.setdefault(widget_key, default)
+seed_form(FORM_DEFAULTS)
 
 render_calibration()
 notice, removed_notice = st.session_state.pop(NOTICE_KEY, None), st.session_state.pop(REMOVED_NOTICE_KEY, None)
@@ -1142,22 +1137,13 @@ submission = render_form()
 if submission is not None:
     strategy_request, input_problems = submission
     calibrated_lap = st.session_state.get(CALIBRATED_LAP_KEY)
-    result: Dict[str, Any] = {
-        "request": strategy_request,
-        "problems": input_problems,
-        "response": None,
-        "error": None,
-        "at": time.time(),
-        "example": unchanged_example(FORM_DEFAULTS) and example_tables(),
+    st.session_state[OUTCOME_KEY] = submit_form(
+        strategy_request,
+        get_client().generate_strategy,
+        example=unchanged_example(FORM_DEFAULTS) and example_tables(),
+        problems=input_problems,
         # The base lap time is still the calibrated one, which already contains the driver's and car's pace.
-        "calibrated_lap_time": calibrated_lap is not None and strategy_request["telemetry"]["lap_times"] == [calibrated_lap],
-    }
-    if not input_problems:
-        try:
-            result["response"] = get_client().generate_strategy(strategy_request)
-        except (ApiUnavailable, ApiError) as exc:
-            result["error"] = exc
-    st.session_state[OUTCOME_KEY] = result
-    st.session_state.pop(PLAN_DETAIL_KEY, None)  # the plan chosen for the previous result
+        calibrated_lap_time=calibrated_lap is not None and strategy_request["telemetry"]["lap_times"] == [calibrated_lap],
+    )
 if st.session_state.get(OUTCOME_KEY):
     render_outcome(st.session_state[OUTCOME_KEY])

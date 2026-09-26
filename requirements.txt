@@ -15,17 +15,20 @@ matplotlib==3.11.2
 # Audio analysis
 librosa==0.11.0
 soundfile==0.14.0
+audioread==3.1.0  # librosa's decoder, used directly for ffmpeg-only containers (M4A, WebM)
 
 # FIA regulation RAG (LangChain + Qdrant)
 langchain-core==1.6.5
 langchain-text-splitters==1.1.2
 langchain-openai==1.6.6
-openai==3.19.2
+openai==3.19.2  # used through langchain-openai; pinned for the wire behaviour tests/test_fia_openai_wire.py checks
 qdrant-client==1.19.1
 pypdf==6.19.0
 
 # Web UI (Streamlit client of the API; see requirements-ui.txt for a UI-only install)
 streamlit==1.64.0
+pandas==3.0.6
+altair==6.3.0
 
 # Utilities
 requests==2.34.2
@@ -33,3 +36,4 @@ python-dotenv==1.2.3
 
 # Tests
 pytest==9.1.1
+pyarrow==25.0.1  # reads the tables the UI tests render

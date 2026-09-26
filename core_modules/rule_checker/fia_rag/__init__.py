@@ -5,9 +5,10 @@ Stages (each in its own module, each configured independently):
     ingestion   PDF validation -> page text -> chunks with source/page/article metadata
     embeddings  LangChain OpenAIEmbeddings (OpenAI or an OpenAI-compatible endpoint)
     index       Qdrant collection with build fingerprints (no stale or duplicate chunks)
+    glossary    official definitions extracted at index time, selected per question
     retrieval   question -> top-k passages -> per-passage similarity threshold
     generation  evidence-only prompt with [S#] labels -> chat model
-    grounding   deterministic validation of citations and article numbers
+    grounding   deterministic validation of citations, rule identifiers, numbers and uncited statements
     pipeline    orchestration, status reporting and the process-wide instance
 """
 

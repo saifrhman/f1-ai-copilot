@@ -25,7 +25,7 @@ Ctrl+C in that terminal stops both servers.
 * **Sidebar.** The navigation, the API address, and the readiness of every API component (`ready`, `not configured`, `unavailable`, ...). The status is cached for 30 seconds and updated on your next action after that; **Refresh status** checks it immediately.
 * **Forms keep their values** while you switch pages. Each page keeps its last result until you submit again. Reloading the browser tab starts a new session, which resets the forms to their examples.
 * **Pre-filled examples.** The strategy, setup and triage forms start with documented example values, and the ghost-car page starts with synthetic laps. A result computed from unchanged example inputs gets a grey **Example inputs · not your data** badge.
-* **Raw data.** Every result has a **Raw API response** expander (the JSON the API returned), and the form pages also show the **Request sent to the API**.
+* **Raw data.** Every result has a **Raw API response** expander (the JSON the API returned), and the form pages also show the **Request sent to the API**. The tyre calibration result sits inside an expander of its own, so it shows both in its **Raw JSON** tab.
 * **What leaves your computer.** Only the regulation Q&A calls an outside service: the model provider in `.env`. Search passages sends the question text (for its embedding). Ask sends the question and the retrieved regulation passages. All other pages run locally in the API. `scripts/fetch_fia_regulations.py` downloads from fia.com. Whisper, if you install it, downloads its model once. Streamlit usage statistics are switched off.
 
 ## Pages
@@ -78,7 +78,7 @@ A **grounded answer** has a green **Grounded answer** badge. It passed every che
 * every article or rule number and every number in the answer occurs in the passages it cites;
 * the answer was not cut off.
 
-Each citation is a blue chip. Clicking a chip under the answer shows that passage, with a link to the official PDF opened at its page.
+Each citation in the answer is a blue badge of the passage labels it names (`[S1-S3]` shows S1, S2, S3), placed where the API's `citation_spans` say the citation is. Clicking a chip under the answer shows that passage, with a link to the official PDF opened at its page.
 
 The card says what was checked and what was not. The deterministic checks do not prove that each sentence means what its passage says. With the claim verifier on, a second model call judges that; its verdict is a model's judgement, not proof. **Read the cited passages before relying on an answer.**
 
@@ -342,13 +342,14 @@ A plain-English question is sent to **one** module, chosen by a transparent **ke
 In the result:
 * **Routed to:** the module.
 * **Score:** named for what that module reports:
-  * Evidence strength (regulations; 0 for a decline);
+  * Evidence strength (regulations; 0 for a decline, "–" when the answer cites only definitions, which have no similarity);
   * Multi-start agreement (setup);
   * Coverage (lap performance);
   * Heuristic score (radio).
 
   The strategy engine reports time margins, not a score. None of these is a probability.
 * **Data sources:** the evidence the answer used.
+* **Regulatory questions:** the cited passages, or the decline reason and what to do next, shown as on the FIA regulations page.
 * **How the question was routed:** the decision rule and the keyword scores.
 
 ### Incident triage
@@ -440,10 +441,10 @@ A message ending in `(HTTP 401): the provider rejected the credentials` (or 403)
 When you start the servers separately instead, give the UI the new address with `F1_API_URL=http://127.0.0.1:8010`.
 
 **Upload limits.**
-* The browser uploader accepts files up to 20 MB (`maxUploadSize` in `ui/.streamlit/config.toml`).
+* The browser uploader accepts files up to 20 MiB (`maxUploadSize` in `ui/.streamlit/config.toml`).
 * Radio clips: at most 20 MiB decoded, 0.5-120 s, up to 2 channels, 8-96 kHz. For long recordings, trim them or save them as FLAC, OGG or MP3.
 * Ghost CSVs: 2-20,000 rows per lap.
-* The API rejects larger request bodies with HTTP 413: 40 MB for the audio routes, 8 MB for the ghost comparison, 1 MB elsewhere.
+* The API rejects larger request bodies with HTTP 413: 40 MiB for the audio routes, 8 MiB for the ghost comparison, 1 MiB elsewhere.
 
 **Whisper unavailable.** The radio page says "Transcription is unavailable on this API" with the reason, for example that `openai-whisper` or ffmpeg is not installed. The acoustic analysis works without it. To add transcription, install ffmpeg and Whisper where the API runs (README: "Optional: Whisper transcription"), check them with `python scripts/check_whisper.py <clip>`, and restart the API: availability is checked once per API process. "Transcription failed" (HTTP 503) means Whisper is installed but failed on this clip; submit again without transcription and check the API log. M4A and WebM clips need ffmpeg even without Whisper. The Docker image includes ffmpeg but not Whisper.
 
@@ -464,7 +465,8 @@ When you start the servers separately instead, give the UI the new address with 
 | --- | --- | --- | --- |
 | `F1_API_URL` | environment, then `.env` | `http://127.0.0.1:8000` | Address of the API. `run_app.py` and Docker Compose set it themselves. `http://user:password@host:port` works for an API behind an authenticating proxy; the credentials are never displayed |
 | `server.address`, `server.port` | `ui/.streamlit/config.toml` | `127.0.0.1`, `8501` | This computer only. Command-line flags override them, e.g. `streamlit run ui/streamlit_app.py --server.port 8600` |
-| `server.maxUploadSize` | `ui/.streamlit/config.toml` | 20 (MB) | Largest file the uploaders accept |
+| `server.maxUploadSize` | `ui/.streamlit/config.toml` | 20 (MiB) | Largest file the uploaders accept |
 | `--host`, `--api-port`, `--ui-port`, `--no-browser` | `python scripts/run_app.py` | `127.0.0.1`, 8000, 8501, opens the browser | `--host 0.0.0.0` makes both servers reachable from your network; neither has authentication, so use it only on a trusted network |
+| `--startup-timeout`, `--stop-timeout` | `python scripts/run_app.py` | 120 s, 10 s | How long the launcher waits for both servers to answer at start-up, and for a server to stop gracefully before it is killed |
 
 To run only the UI against an API on another machine: `pip install -r requirements-ui.txt`, set `F1_API_URL` (for example `http://192.168.1.20:8000`), then `streamlit run ui/streamlit_app.py`.

@@ -17,7 +17,7 @@ import pandas as pd
 import streamlit as st
 
 from ui.api_client import ApiError, ApiUnavailable, get_client
-from ui.components import heuristic_badge, json_expander, md_text, show_api_error
+from ui.components import code_span, heuristic_badge, humanise, json_expander, md_text, show_api_error, show_input_problems
 
 RESULT_KEY = "ghost_result"
 EXAMPLE, UPLOAD = "Example laps", "Upload CSV files"
@@ -162,12 +162,6 @@ def template_csv() -> bytes:
 # ------------------------------------------------------------------ CSV reading
 
 
-def quoted(name: Any) -> str:
-    """A file or column name as a Markdown code span."""
-
-    return "`" + str(name).replace("`", "'") + "`"
-
-
 def parse_cell(text: str, channel: str) -> Any:
     """One CSV value of ``channel``; raises ValueError with the reason."""
 
@@ -217,16 +211,16 @@ def read_lap_csv(data: bytes) -> Tuple[Dict[str, List[Any]], List[str], List[str
         name = str(raw).strip().lower()
         channel = next((channel for channel, names in CHANNEL_ALIASES.items() if name in names), name)
         if channel in columns:
-            problems.append(f"columns {quoted(columns[channel])} and {quoted(raw)} both hold {channel}; keep one")
+            problems.append(f"columns {code_span(columns[channel])} and {code_span(raw)} both hold {channel}; keep one")
         columns[channel] = str(raw)
-    found = ", ".join(quoted(name) for name in frame.columns) or "none"
+    found = ", ".join(code_span(name) for name in frame.columns) or "none"
     if len(frame.columns) == 1 and ";" in str(frame.columns[0]):
         found += "; the file seems to use ';' between values: save it with commas"
     for channel, names in (("timestamps", TIME_COLUMNS), ("speed", SPEED_COLUMNS)):
         if channel not in columns:
-            problems.append(f"missing the {quoted(names[0])} column (columns found: {found})")
+            problems.append(f"missing the {code_span(names[0])} column (columns found: {found})")
     ignored = [raw for channel, raw in columns.items() if channel not in ("timestamps", "speed", *OPTIONAL_CHANNELS)]
-    notes = [f"ignored columns: {', '.join(map(quoted, ignored))} (not used by the comparison)"] if ignored else []
+    notes = [f"ignored columns: {', '.join(map(code_span, ignored))} (not used by the comparison)"] if ignored else []
     if not MIN_SAMPLES <= len(frame) <= MAX_SAMPLES:
         problems.append(f"it has {len(frame)} data rows; {MIN_SAMPLES} to {MAX_SAMPLES} are needed")
     if problems:
@@ -240,12 +234,12 @@ def read_lap_csv(data: bytes) -> Tuple[Dict[str, List[Any]], List[str], List[str
         for row, cell in enumerate(frame[raw].tolist(), start=1):
             text = cell.strip() if isinstance(cell, str) else ""  # short rows give NaN
             if not text:
-                problems.append(f"column {quoted(raw)}: data row {row} is empty (fill it, or remove the column)")
+                problems.append(f"column {code_span(raw)}: data row {row} is empty (fill it, or remove the column)")
                 break
             try:
                 values.append(parse_cell(text, channel))
             except ValueError as exc:
-                problems.append(f"column {quoted(raw)}: data row {row}: {exc}")
+                problems.append(f"column {code_span(raw)}: data row {row}: {exc}")
                 break
         channels[channel] = values
     stamps = channels.get("timestamps", [])
@@ -281,8 +275,8 @@ def uploaded_lap(key: str, label: str) -> Tuple[Optional[Dict[str, Any]], List[s
     if upload is None:
         return None, [], [f"{label}: upload a CSV file"]
     channels, notes, problems = read_lap_csv(upload.getvalue())
-    notes = [f"{label} ({quoted(upload.name)}): {note}" for note in notes]
-    problems = [f"{label} ({quoted(upload.name)}): {problem}" for problem in problems]
+    notes = [f"{label} ({code_span(upload.name)}): {note}" for note in notes]
+    problems = [f"{label} ({code_span(upload.name)}): {problem}" for problem in problems]
     telemetry: Dict[str, Any] = dict(channels)
     for field in ("lap_number", "lap_time"):
         value = st.session_state.get(f"ghost_{key}_{field}")
@@ -333,7 +327,7 @@ def lap_rows(body: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "Telemetry span (s)": lap.get("telemetry_duration_s"),
                 "Distance (m)": lap.get("distance_m"),
                 "Lap time (s)": lap.get("lap_time_s"),
-                "Lap time from": str(lap.get("lap_time_source", "")).replace("_", " "),
+                "Lap time from": humanise(lap.get("lap_time_source", "")),
                 "Missing channels": ", ".join(body["missing_channels"][key]) or "none",
             }
         )
@@ -365,7 +359,7 @@ def render_channel_tables(body: Dict[str, Any]) -> None:
                     for number, delta in enumerate(sectors, start=1)
                 ],
                 hide_index=True,
-                column_config={name: SECONDS for name in ("Lap 1 (s)", "Lap 2 (s)", "Lap 2 - lap 1 (s)")},
+                column_config=dict.fromkeys(("Lap 1 (s)", "Lap 2 (s)", "Lap 2 - lap 1 (s)"), SECONDS),
             )
     with tabs[2]:
         if braking is None:
@@ -384,16 +378,16 @@ def render_channel_tables(body: Dict[str, Any]) -> None:
                     for zone in braking["matched_zones"]
                 ],
                 hide_index=True,
-                column_config={
-                    name: METRES
-                    for name in (
+                column_config=dict.fromkeys(
+                    (
                         "Lap 1 braking from (m)",
                         "Lap 2 braking from (m)",
                         "Brake point delta (m; > 0 = lap 2 later)",
                         "Lap 1 braking to (m)",
                         "Lap 2 braking to (m)",
-                    )
-                },
+                    ),
+                    METRES,
+                ),
             )
             st.caption(
                 f"Braking zones: {braking['lap1_zone_count']} in lap 1, {braking['lap2_zone_count']} in lap 2, "
@@ -471,8 +465,8 @@ def render_result(result: Dict[str, Any]) -> None:
     st.caption(
         f"Largest gap {shown_delta(summary['max_delta_s'], 3):+.3f} s at {summary['max_delta_at_m']:.0f} m, smallest "
         f"{shown_delta(summary['min_delta_s'], 3):+.3f} s at {summary['min_delta_at_m']:.0f} m. Alignment: "
-        f"**{alignment['method'].replace('_', ' ')}** (requested {alignment['requested'].replace('_', ' ')}), distance from "
-        f"{alignment['distance_source'].replace('_', ' ')} over {alignment['compared_distance_m']:.0f} m. "
+        f"**{humanise(alignment['method'])}** (requested {humanise(alignment['requested'])}), distance from "
+        f"{humanise(alignment['distance_source'])} over {alignment['compared_distance_m']:.0f} m. "
         f"{md_text(alignment['description'])}"
     )
     for warning in body.get("warnings") or []:
@@ -574,12 +568,9 @@ if submitted:
         names = [
             st.session_state[f"ghost_{key}_file"].name for key in ("lap1", "lap2") if st.session_state.get(f"ghost_{key}_file")
         ]
-        label = " (reference) vs ".join(map(quoted, names)) + " (comparison)"
+        label = " (reference) vs ".join(map(code_span, names)) + " (comparison)"
     if problems:
-        st.error(
-            "Nothing was sent to the API. Please fix:\n" + "\n".join(f"- {problem}" for problem in problems),
-            icon=":material/rule:",
-        )
+        show_input_problems(problems)
     else:
         payload: Dict[str, Any] = {
             "lap1_telemetry": lap1,

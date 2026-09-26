@@ -1,17 +1,9 @@
 # F1 AI Copilot: one image for the API (default command) and the web UI.
 #
-# Run it with Docker Compose from the project folder: docker-compose.yml starts the api, ui and qdrant
-# services from this image, and the UI's fix steps use the same Compose commands.
-#
-#   mkdir -p data/fia_docs .cache outputs          # bind-mounted; create them before the first run
-#   docker compose up -d --build                    # UI http://127.0.0.1:8501, API http://127.0.0.1:8000/docs
-#   docker compose run --rm api python scripts/fetch_fia_regulations.py
-#   docker compose run --rm api python scripts/build_fia_index.py --dry-run   # then without --dry-run
-#   docker compose down                             # stop (the index stays in the qdrant volume)
-#
-# Settings and the API key are read from .env at runtime (.dockerignore keeps .env out of the image).
-# Bind-mounted host folders must be writable by APP_UID: on Linux build with your user id
-# (APP_UID=$(id -u) docker compose build) if it is not 1000.
+# Run it with Docker Compose from the project folder: docker-compose.yml runs the api and ui services
+# from this image next to a qdrant/qdrant server; the commands are in its header and in README
+# "Docker Compose". Settings and the API key are read from .env at runtime (.dockerignore keeps .env
+# out of the image).
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

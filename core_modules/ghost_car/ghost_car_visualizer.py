@@ -147,8 +147,14 @@ class _Comparison:
 
     @property
     def distance_mismatch(self) -> float:
-        total1, total2 = self.lap1.total_distance, self.lap2.total_distance
-        return abs(total1 - total2) / max(total1, total2)
+        return _distance_mismatch(self.lap1, self.lap2)
+
+
+def _distance_mismatch(lap1: _Lap, lap2: _Lap) -> float:
+    """Relative difference of the two laps' total distances."""
+
+    total1, total2 = lap1.total_distance, lap2.total_distance
+    return abs(total1 - total2) / max(total1, total2)
 
 
 # --------------------------------------------------------------------------- #
@@ -258,42 +264,6 @@ def prune_artifacts(
     return removed
 
 
-class GhostCarVisualizer:
-    """Comparison bound to one artifact directory (immutable, thread-safe)."""
-
-    def __init__(
-        self,
-        output_dir: Union[str, os.PathLike],
-        max_artifacts: int = DEFAULT_MAX_ARTIFACTS,
-        max_artifact_age_s: float = DEFAULT_MAX_ARTIFACT_AGE_S,
-    ):
-        self.output_dir = Path(output_dir)
-        self.max_artifacts = max_artifacts
-        self.max_artifact_age_s = max_artifact_age_s
-
-    def generate_ghost_comparison(
-        self,
-        lap1_telemetry: Union[LapTelemetry, Mapping[str, Any]],
-        lap2_telemetry: Union[LapTelemetry, Mapping[str, Any]],
-        track_section: Optional[str] = None,
-        alignment: str = AlignmentMode.AUTO.value,
-    ) -> Dict[str, Any]:
-        request = GhostCarRequest.model_validate(
-            {
-                "lap1_telemetry": lap1_telemetry,
-                "lap2_telemetry": lap2_telemetry,
-                "track_section": track_section,
-                "alignment": alignment,
-            }
-        )
-        return generate_ghost_comparison(
-            request,
-            self.output_dir,
-            max_artifacts=self.max_artifacts,
-            max_artifact_age_s=self.max_artifact_age_s,
-        )
-
-
 # --------------------------------------------------------------------------- #
 # Distance and alignment
 # --------------------------------------------------------------------------- #
@@ -401,8 +371,7 @@ def _analyse(request: GhostCarRequest) -> _Comparison:
     lap1 = _Lap(t1, e1, d1, d1, *_lap_time(t1, float(e1[-1])))
     lap2 = _Lap(t2, e2, d2, d2, *_lap_time(t2, float(e2[-1])))
     total1, total2 = lap1.total_distance, lap2.total_distance
-    mismatch = abs(total1 - total2) / max(total1, total2)
-    method = _choose_method(request.alignment, mismatch, lap1.line_to_line and lap2.line_to_line)
+    method = _choose_method(request.alignment, _distance_mismatch(lap1, lap2), lap1.line_to_line and lap2.line_to_line)
 
     if method == AlignmentMode.LAP_FRACTION:
         ref2, end = d2 * (total1 / total2), total1

@@ -10,50 +10,25 @@ from core_modules.rule_checker.fia_rag import (
     IndexNotReadyError,
     QdrantConfig,
     RAGConfigurationError,
-    RAGSettings,
     RetrievalConfig,
     VectorStoreError,
 )
 from core_modules.rule_checker.fia_rag.index import close_qdrant_clients, create_qdrant_client
-from tests.helpers import HashingEmbeddings, ScriptedChatModel, fia_page, write_pdf
-
-PIT_LANE = (
-    "B1.6 Pit Lane Speed\nB1.6.3 Driving in the Pit Entry Road, Pit Lane and Pit Exit Road "
-    "a. A speed limit of 80km/h will be imposed in the pit lane during all sessions."
-)
-UNSAFE_RELEASE = (
-    "B4.2 Unsafe Release\nB4.2.1 A car must not be released from its pit stop position in an unsafe "
-    "condition. Competitors are responsible for releasing cars only when it is safe."
-)
-FUEL_FLOW = "C5.4 Fuel Flow\nC5.4.2 The fuel mass flow must not exceed one hundred kilograms per hour above 10500 rpm."
-REAR_WING = "C3.9 Rear Wing\nC3.9.1 The rear wing flap position may be adjusted by the driver only when the adjustable wing is enabled."
+from core_modules.rule_checker.fia_rag.ingestion import load_chunks_and_pages
+from tests.helpers import PIT_LANE, HashingEmbeddings, ScriptedChatModel, rag_settings, write_pdf, write_regulation_corpus
 
 
 @pytest.fixture
 def docs(tmp_path):
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_LANE), None, fia_page(3, UNSAFE_RELEASE)])
-    write_pdf(folder / "section_c_technical.pdf", [FUEL_FLOW, REAR_WING])
-    return folder
+    return write_regulation_corpus(tmp_path / "fia_docs")
 
 
 def make_settings(docs, tmp_path, **overrides):
-    values = dict(
-        docs_path=docs,
-        chunking=ChunkingConfig(chunk_size=400, chunk_overlap=40),
-        embedding=EmbeddingConfig(model="hashing-test-512", batch_size=2),
-        retrieval=RetrievalConfig(top_k=4, min_score=0.2),
-        qdrant=QdrantConfig(collection="fia_test", path=tmp_path / "qdrant"),
-    )
-    values.update(overrides)
-    return RAGSettings(**values)
-
-
-@pytest.fixture
-def qdrant():
-    client = QdrantClient(":memory:")
-    yield client
-    client.close()
+    defaults = {  # batches of 2 texts, so that embedding batches can be counted
+        "embedding": EmbeddingConfig(model="hashing-test-512", batch_size=2),
+        "qdrant": QdrantConfig(collection="fia_test", path=tmp_path / "qdrant"),
+    }
+    return rag_settings(docs, **{**defaults, **overrides})
 
 
 def make_rag(docs, tmp_path, qdrant, embeddings=None, llm=None, **overrides):
@@ -80,6 +55,20 @@ def test_index_build_is_idempotent_and_does_not_reembed(docs, tmp_path, qdrant):
     assert second.status == third.status == "up_to_date"
     assert embeddings.document_calls == calls_after_first == 2  # 4 chunks / batch_size 2
     assert qdrant.count("fia_test", exact=True).count == 4
+
+
+def test_dry_run_plan_estimates_the_build_without_calling_the_provider(docs, tmp_path, qdrant):
+    embeddings = HashingEmbeddings()
+    rag = make_rag(docs, tmp_path, qdrant, embeddings)
+    plan = rag.plan_index()
+    assert (plan["chunks"], plan["embedding_requests"]) == (4, 2)  # 4 chunks / batch_size 2
+    assert plan["fingerprint"] == rag.fingerprint()
+    assert embeddings.documents_embedded == 0 and not qdrant.collection_exists("fia_test")
+    # Each chunk is embedded with its one-line context header, so the estimate counts that text too.
+    chunks, _, _ = load_chunks_and_pages(rag.discover().documents, rag.settings.chunking)
+    assert plan["characters"] == sum(len(chunk.embedding_text) for chunk in chunks) > sum(len(chunk.text) for chunk in chunks)
+    rag.build_index()
+    assert embeddings.documents_embedded == plan["chunks"]
 
 
 def test_forced_rebuild_replaces_instead_of_duplicating(docs, tmp_path, qdrant):

@@ -77,6 +77,14 @@ MAX_TERM_FREQUENCY = 0.2
 MIN_CHUNKS_FOR_FREQUENCY = 50
 
 
+def _find(key: str, text: str, ignore_case: bool = False) -> int:
+    """Offset of ``key`` as a whole word in ``text``, or -1."""
+
+    flags = re.IGNORECASE if ignore_case else 0
+    match = re.search(rf"(?<![A-Za-z0-9]){re.escape(key)}(?![A-Za-z0-9])", text, flags)
+    return match.start() if match else -1
+
+
 def with_frequencies(entries: Sequence[GlossaryEntry], chunk_texts: Sequence[str]) -> List[GlossaryEntry]:
     """Attach, per abbreviation, the share of chunks that use it (0 for corpora too small to tell)."""
 
@@ -85,8 +93,7 @@ def with_frequencies(entries: Sequence[GlossaryEntry], chunk_texts: Sequence[str
     for entry in entries:
         frequency = 0.0
         if entry.abbreviation and total >= MIN_CHUNKS_FOR_FREQUENCY:
-            pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(entry.abbreviation)}(?![A-Za-z0-9])")
-            frequency = sum(1 for text in chunk_texts if pattern.search(text)) / total
+            frequency = sum(1 for text in chunk_texts if _find(entry.abbreviation, text) >= 0) / total
         result.append(replace(entry, frequency=round(frequency, 4)))
     return result
 
@@ -143,14 +150,6 @@ _REFERENTIAL = re.compile(r"has\s+the\s+meaning\s+(?:given|set\s+out|ascribed|as
 
 def _useful(entry: GlossaryEntry) -> bool:
     return not (_REFERENTIAL.search(entry.definition) and len(entry.definition) < 200)
-
-
-def _find(key: str, text: str, ignore_case: bool = False) -> int:
-    """Offset of ``key`` as a whole word in ``text``, or -1."""
-
-    flags = re.IGNORECASE if ignore_case else 0
-    match = re.search(rf"(?<![A-Za-z0-9]){re.escape(key)}(?![A-Za-z0-9])", text, flags)
-    return match.start() if match else -1
 
 
 def definitions_for(

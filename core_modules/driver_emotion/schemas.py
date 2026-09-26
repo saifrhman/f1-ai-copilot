@@ -111,6 +111,7 @@ class EmotionResponse(BaseModel):
     )
     acoustic_emotion: EmotionType
     acoustic_confidence: float = Field(ge=0.0, le=MAX_CONFIDENCE, allow_inf_nan=False)
+    acoustic_confidence_rule: str = Field(description="How acoustic_confidence is computed from the profile scores")
     acoustic_profile_scores: Dict[str, float] = Field(description="Band-similarity score (0-1) of each heuristic emotion profile")
     audio_features: AudioFeatures = Field(description="Acoustic features (heuristic inputs); each field states its frame set")
     duration: float = Field(gt=0.0, allow_inf_nan=False, description="Clip duration in seconds")
@@ -125,5 +126,8 @@ class EmotionResponse(BaseModel):
     text_keyword_hits: Optional[Dict[str, List[str]]] = None
     negated_keywords: Optional[List[str]] = None
     evidence_combination: EvidenceCombination
+    evidence_combination_rule: str = Field(
+        description="What the evidence_combination rule does and how it computes confidence from the acoustic and text scores"
+    )
     classifier: str
     disclaimer: str

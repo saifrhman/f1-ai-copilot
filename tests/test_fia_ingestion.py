@@ -8,7 +8,7 @@ from core_modules.rule_checker.fia_rag import ChunkingConfig, DocumentError, RAG
 from core_modules.rule_checker.fia_rag.ingestion import (
     chunk_pages,
     discover_documents,
-    load_and_chunk,
+    load_chunks_and_pages,
     load_pages,
     split_page_header,
 )
@@ -129,7 +129,7 @@ def test_fia_page_header_is_removed_and_printed_page_label_kept(tmp_path):
 
 def test_split_page_header_leaves_ordinary_text_untouched():
     text = "Article 12.4 The car must remain within the limit. Issue 3 of the bulletin."
-    assert split_page_header(text) == (None, "", text)
+    assert split_page_header(text) == (None, text)
 
 
 def test_contents_pages_are_skipped_but_reported(tmp_path):
@@ -176,7 +176,7 @@ def test_invalid_chunk_configuration_is_rejected(size, overlap):
 
 def test_unusually_long_page_is_split_and_keeps_page_metadata(tmp_path):
     documents = _one_doc(tmp_path, ["Short page one with enough regulation words.", _long_article(80)])
-    chunks, reports = load_and_chunk(documents, ChunkingConfig(chunk_size=500, chunk_overlap=50))
+    chunks, reports, _ = load_chunks_and_pages(documents, ChunkingConfig(chunk_size=500, chunk_overlap=50))
     page_two = [c for c in chunks if c.metadata["page"] == 2]
     assert len(page_two) > 5
     assert reports[0].chunks == len(chunks)
@@ -187,8 +187,8 @@ def test_unusually_long_page_is_split_and_keeps_page_metadata(tmp_path):
 def test_chunks_are_meaningful_and_ids_deterministic_even_for_repeated_text(tmp_path):
     repeated = "B3.1 Identical wording appears on two different pages of the regulations."
     documents = _one_doc(tmp_path, [repeated, "7", repeated])
-    first, _ = load_and_chunk(documents, ChunkingConfig(chunk_size=500, chunk_overlap=50))
-    second, _ = load_and_chunk(documents, ChunkingConfig(chunk_size=500, chunk_overlap=50))
+    first, _, _ = load_chunks_and_pages(documents, ChunkingConfig(chunk_size=500, chunk_overlap=50))
+    second, _, _ = load_chunks_and_pages(documents, ChunkingConfig(chunk_size=500, chunk_overlap=50))
     assert [c.chunk_id for c in first] == [c.chunk_id for c in second]
     assert len({c.chunk_id for c in first}) == len(first) == 2  # "7"-only page is layout debris
     assert all(c.text.strip() for c in first)
@@ -202,7 +202,7 @@ def test_article_context_is_carried_across_page_boundaries(tmp_path):
             "continued text of the same article describing the responsibilities of competitors in the pit lane.",
         ],
     )
-    chunks, _ = load_and_chunk(documents, ChunkingConfig(chunk_size=500, chunk_overlap=0))
+    chunks, _, _ = load_chunks_and_pages(documents, ChunkingConfig(chunk_size=500, chunk_overlap=0))
     assert chunks[0].metadata["nearest_rule"] in {"B4.2", "B4.2.1"}
     assert chunks[1].metadata["page"] == 2
     assert chunks[1].metadata["nearest_rule"] == "B4.2.1"
@@ -212,7 +212,7 @@ def test_article_context_is_carried_across_page_boundaries(tmp_path):
 def test_multiple_documents_keep_their_own_source(tmp_path):
     write_pdf(tmp_path / "section_b.pdf", ["B1.1 Sporting regulation text for document one."])
     write_pdf(tmp_path / "section_c.pdf", ["C1.1 Technical regulation text for document two."])
-    chunks, reports = load_and_chunk(discover_documents(tmp_path).documents, ChunkingConfig())
+    chunks, reports, _ = load_chunks_and_pages(discover_documents(tmp_path).documents, ChunkingConfig())
     assert {c.metadata["source"] for c in chunks} == {"section_b.pdf", "section_c.pdf"}
     assert [r.filename for r in reports] == ["section_b.pdf", "section_c.pdf"]
 
@@ -240,9 +240,11 @@ def test_identifiers_split_by_pdf_extraction_are_rejoined():
 
 
 def test_rule_support_accepts_parents_but_not_invented_children():
-    assert is_supported("B2.3", ["B2.3.5"])
-    assert is_supported("B2.3.4", ["B2.3.4c"])
-    assert not is_supported("B2.3.5.1", ["B2.3.5"])
-    assert not is_supported("B2.35", ["B2.3.5"])
-    assert is_supported("B1.6.3a", ["B1.6.3"]) and is_supported("B1.6.3.a", ["B1.6.3"])
-    assert not is_supported("Z1.1", ["B1.6.3"]) and not is_supported("B1.6.4a", ["B1.6.3"])
+    assert is_supported("B2.3", ["B2.3.5"], set())
+    assert is_supported("B2.3.4", ["B2.3.4c"], set())
+    assert not is_supported("B2.3.5.1", ["B2.3.5"], set())
+    assert not is_supported("B2.35", ["B2.3.5"], set())
+    # A lettered item needs its article and that letter as an item marker in the evidence.
+    assert is_supported("B1.6.3a", ["B1.6.3"], {"a"}) and is_supported("B1.6.3.a", ["B1.6.3"], {"a"})
+    assert not is_supported("B1.6.3a", ["B1.6.3"], {"b"})
+    assert not is_supported("Z1.1", ["B1.6.3"], {"a"}) and not is_supported("B1.6.4a", ["B1.6.3"], {"a"})

@@ -6,23 +6,27 @@ on:
       - main
     paths:
       - "core_modules/rule_checker/fia_rag/**"
+      - "core_modules/rule_checker/fia_files.py"
       - "scripts/*fia*"
       - "tests/test_fia_*.py"
       - "tests/test_fetch_fia_regulations.py"
       - "tests/test_check_fia_rag.py"
       - "tests/helpers.py"
       - "tests/conftest.py"
+      - "pyproject.toml"
       - "requirements-rag.txt"
       - ".github/workflows/fia-rag-tests.yml"
   pull_request:
     paths:
       - "core_modules/rule_checker/fia_rag/**"
+      - "core_modules/rule_checker/fia_files.py"
       - "scripts/*fia*"
       - "tests/test_fia_*.py"
       - "tests/test_fetch_fia_regulations.py"
       - "tests/test_check_fia_rag.py"
       - "tests/helpers.py"
       - "tests/conftest.py"
+      - "pyproject.toml"
       - "requirements-rag.txt"
       - ".github/workflows/fia-rag-tests.yml"
 

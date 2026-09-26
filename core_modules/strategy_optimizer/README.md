@@ -26,7 +26,7 @@ lap time = mean(telemetry.lap_times) x driver multiplier x damage/wear multiplie
   - `engine_wear` above 0.7: up to +2%;
   - `brake_wear` above 0.8: up to +1.5%.
 - **Pit stops**: each stop costs the `pit_stop_delta` of the compound fitted at that stop. The earliest stop is at the end of `current_lap`, and a pit lap is the last lap of the stint before the stop.
-- **Weather** is assumed constant for the remaining laps. Stops fit soft/medium/hard tyres in the dry and intermediate/wet tyres otherwise. The old "Intermediate-to-Dry" candidate was removed because the model cannot represent a drying track.
+- **Weather** is assumed constant for the remaining laps. Stops fit soft/medium/hard tyres in the dry and intermediate/wet tyres otherwise. No drying-track (intermediate-to-dry) candidate is generated, because the model cannot represent a drying track.
 
 ### Current tyre state
 
@@ -59,7 +59,7 @@ In a race without intermediate/wet tyres, at least two different dry compounds m
 - `strategies`: up to 8 candidates, fastest first. The fastest plan of each stop count is always included. Each candidate has:
   - `strategy_id` (for example `1-stop:medium/hard`), `rank`, `pit_stops`, `tire_compounds` and `pit_laps`;
   - `projected_race_time`, `driving_time_s` and `pit_time_loss_s` (seconds, remaining laps only);
-  - `delta_to_best_s`, which replaces the old `confidence_score`. That score was a near-constant data-presence flag, not a probability;
+  - `delta_to_best_s` (seconds behind the fastest plan; there is no confidence score);
   - `risk_level`, a label from the stop count only;
   - `two_compound_rule`, `stint_breakdown` and `notes`.
 - `stint_breakdown`: each entry has `start_lap`, `end_lap`, `laps`, `tire_compound`, `tire_age_start`, `tire_age_end`, `fitted_at_stop`, `average_lap_time`, `best_lap_time`, `worst_lap_time`, `total_time`, `start_performance`, `end_performance`, `laps_beyond_peak_window` (tyre laps after the end of the peak window) and `laps_at_performance_floor`.
@@ -105,15 +105,15 @@ All inputs are validated, and invalid input raises `ValueError`. Through the pyd
 ## Usage
 
 ```python
-from core_modules.strategy_optimizer.schemas import StrategyRequest, strategy_result_to_dict
-from core_modules.strategy_optimizer.strategy_engine import generate_strategy
+from core_modules.strategy_optimizer.schemas import StrategyRequest, generate_strategy_response
 
-request = StrategyRequest.model_validate(payload)          # or StrategyRequest.from_context(context)
-result = generate_strategy(**request.to_engine_inputs())   # ValueError on invalid/impossible input
-body = strategy_result_to_dict(result)
+request = StrategyRequest.model_validate(payload)   # or StrategyRequest.from_context(context)
+body = generate_strategy_response(request)          # the JSON body of POST /api/strategy/generate
 ```
 
-`StrategyRequest.from_context(context)` ignores unrelated top-level keys of a natural-query context (for example `audio_file` or `track_profile`). The strategy keys are validated exactly like the POST body, so a context whose `telemetry` also has `sector_times` is accepted. `result.best` is the fastest candidate. There is no confidence value: report `delta_to_best_s` or `tire_state` instead.
+`generate_strategy_response` raises `ValueError` on invalid or impossible input. Callers that need the `StrategyResult` itself run `generate_strategy(**request.to_engine_inputs())` and serialise it with `strategy_result_to_dict`; `result.best` is the fastest candidate.
+
+`StrategyRequest.from_context(context)` ignores unrelated top-level keys of a natural-query context (for example `audio_file` or `track_profile`). The strategy keys are validated exactly like the POST body, so a context whose `telemetry` also has `sector_times` is accepted. There is no confidence value: report `delta_to_best_s` or `tire_state` instead.
 
 `evaluate_plan(compounds, stint_lengths, telemetry, car_status, driver_profile, tire_data, race_state)` projects one user-specified plan with the same model (a "what if I pit on lap X" query).
 
@@ -204,7 +204,7 @@ Every injected outlier was rejected. At most 2 ordinary laps per run were reject
 
 Contaminated histories (development sweeps, not part of the test suite; one compound, 80 s plus 0.05 s per lap after tyre age 10):
 
-- Two stints (56 laps) with runs of 3-5 consecutive unflagged safety-car laps (35-50 s slower): with one run, 100 of 100 seeds were estimated within 0.15 s of the true peak. With two or three runs, 193 of 200 were; 6 were `insufficient_data` and 1 was estimated 0.39 s off. The previous version, without the 25% and 3% guards, reported all 300 as `estimated`. Five of them were 2.6-9.9 s off (peaks from 70.1 to 87.9 s) with only a "Poor fit" note.
+- Two stints (56 laps) with runs of 3-5 consecutive unflagged safety-car laps (35-50 s slower): with one run, 100 of 100 seeds were estimated within 0.15 s of the true peak. With two or three runs, 193 of 200 were; 6 were `insufficient_data` and 1 was estimated 0.39 s off. Without the 25% and 3% guards all 300 would be reported as `estimated`, five of them 2.6-9.9 s off (peaks from 70.1 to 87.9 s) with only a "Poor fit" note.
 - 1500 histories of 10-79 laps with 30-70% junk laps (a second level 6 s slower, Cauchy errors, or uniform 20-600 s): 1001 were `insufficient_data`. 77 of the 499 estimates were more than 0.5 s from the 80 s level. 63 of those carried a "Poor fit" or "Possible mixed pace" note; the other 14 were cases where the junk laps were the majority (the fit then follows the majority), or estimates 0.5-0.9 s off under Cauchy errors.
 
 On a development machine (8 cores, load about 2.5) a calibration of 2000 laps took about 0.1 s, and about 0.3 s with 30% junk laps (all compounds are then `insufficient_data`).
@@ -242,7 +242,8 @@ The tests cover:
 - invariants over random valid states;
 - determinism and thread safety;
 - NaN, negative, out-of-range and mismatched inputs;
-- the schema round trip, a shared natural-query context with `sector_times`, the free-form fields, and the JSON-safe response.
+- the schema round trip, a shared natural-query context with `sector_times`, the free-form fields, and the JSON-safe response;
+- that the request schema and the engine reject each cross-field rule with one shared message (the engine adds the field's location to it).
 
 The calibration tests (`tests/test_strategy_calibration.py`) generate lap histories with the engine's own model (`evaluate_plan`) and cover:
 
@@ -254,7 +255,7 @@ The calibration tests (`tests/test_strategy_calibration.py`) generate lap histor
 - the notes: "Poor fit", "Possible mixed pace", slower laps beyond the oldest age used (flat fit and cliff), an unidentifiable peak, and alternating outlier rejection keeping the largest set;
 - the small-sample rejection threshold, outlier and flag reasons, `tire_age_range` of the laps used, and excluded laps sorted by position;
 - determinism and lap-order independence;
-- invalid input through the function and the schema.
+- invalid input through the function and the schema, with one shared message for each cross-field rule.
 
 ## Not modelled
 

@@ -1,9 +1,25 @@
 """The end-to-end evaluation's checks must fail when the RAG misbehaves (no trivially passing harness)."""
 
 import json
+import sys
+from dataclasses import replace
 
+import pytest
+
+import scripts.check_fia_rag as check_fia_rag
+from core_modules.rule_checker.fia_rag import GenerationConfig
+from core_modules.rule_checker.fia_rag.generation import VERIFIER_PROMPT
 from core_modules.rule_checker.fia_rag.retrieval import RetrievalResult, RetrievedPassage
-from scripts.check_fia_rag import QUESTIONS_FILE, _contains, calibrate, evaluate, required_score
+from scripts.check_fia_rag import (
+    ANSWERABLE_CATEGORIES,
+    QUESTIONS_FILE,
+    _contains,
+    calibrate,
+    evaluate,
+    min_score_argument,
+    required_score,
+)
+from tests.helpers import build_test_rag, cite_passage_containing
 
 
 def result(answer="The limit is 80km/h [S1].", grounded=True, sections=("B",), cited=(True,), texts=("A speed limit of 80km/h",), citations=("S1",), unsupported=()):
@@ -74,13 +90,11 @@ def test_question_file_is_well_formed():
     categories = {q["category"] for q in questions}
     assert {"answerable", "paraphrased", "cross_document", "unanswerable", "adversarial"} <= categories
     for q in questions:
-        if q["category"] in {"answerable", "paraphrased", "cross_document"}:
+        if q["category"] in ANSWERABLE_CATEGORIES:
             assert q["expected_sections"] and q["expected_facts_any"]
 
 
 def test_fact_checks_use_whole_numbers_not_substrings():
-    from scripts.check_fia_rag import _contains
-
     assert _contains("The limit is 80 km/h [S1].", "80") and _contains("fined €100 per km/h", "100")
     assert not _contains("up to 800 km/h", "80") and not _contains("from 29 December", "9")
     assert _contains("US $215,000,000", "215000000") and _contains("US Dollars 215,000,000", "215,000,000")
@@ -146,3 +160,45 @@ def test_facts_split_by_a_pdf_line_break_inside_a_hyphenated_word_are_found():
     assert not _contains("a stop and a go-kart", "stop-and-go")
     # Models often write non-breaking hyphens (U+2011).
     assert _contains("a Stop\u2011and\u2011Go Penalty", "stop-and-go")
+
+
+# ------------------------------------------------------------------ command line
+
+
+@pytest.mark.parametrize("value", ["0", "0.3", "1"])
+def test_threshold_argument_accepts_a_similarity(value):
+    assert min_score_argument(value) == float(value)
+
+
+@pytest.mark.parametrize("value", ["1.5", "-0.1", "nan", "inf", "high"])
+def test_an_invalid_threshold_is_rejected_before_anything_runs(value, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["check_fia_rag.py", "--threshold", value])
+    monkeypatch.setattr(check_fia_rag, "get_fia_rag", lambda: pytest.fail("the retrieval phase started"))
+    with pytest.raises(SystemExit) as exited:
+        check_fia_rag.main()
+    assert exited.value.code == 2 and "argument --threshold" in capsys.readouterr().err
+
+
+def test_the_summary_counts_the_claim_verifier_calls(tmp_path, monkeypatch, capsys):
+    rag, llm, qdrant = build_test_rag(tmp_path / "fia_docs")
+    rag.settings = replace(rag.settings, generation=GenerationConfig(verify_claims=True))
+    answer = cite_passage_containing("80km/h")
+    llm.reply = lambda messages: '{"unsupported": []}' if messages[0].content == VERIFIER_PROMPT else answer(messages)
+    rag.build_index()
+    question = {
+        "id": "pit-limit",
+        "category": "answerable",
+        "question": "What is the speed limit in the pit lane?",
+        "expected_facts_any": [["80km/h"]],
+    }
+    questions = tmp_path / "questions.json"
+    questions.write_text(json.dumps({"questions": [question]}))
+    monkeypatch.setattr(check_fia_rag, "QUESTIONS_FILE", questions)
+    monkeypatch.setattr(check_fia_rag, "get_fia_rag", lambda: rag)
+    monkeypatch.setattr(sys, "argv", ["check_fia_rag.py", "--report", str(tmp_path / "report.json")])
+    try:
+        assert check_fia_rag.main() == 0
+    finally:
+        qdrant.close()
+    assert len(llm.calls) == 2  # the answer and its claim verification
+    assert "chat requests=2" in capsys.readouterr().out

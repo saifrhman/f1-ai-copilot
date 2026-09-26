@@ -14,9 +14,10 @@ module *enforces* it. An answer is only accepted when:
   an inference ("Thus", "Therefore", ...) or only talks about the excerpts
   ("The excerpts do not specify ..."),
 * every article/section/appendix identifier it mentions occurs in the passages it cites,
-* every number it states (limits, penalties, amounts, times) occurs in the passages
-  it cites - list markers, citation labels, rule identifiers and inference-marked
-  sentences excepted.
+* every number it states (limits, penalties, amounts, times) occurs in the text of the
+  passages it cites - list markers, citation labels, rule identifiers, inference-marked
+  sentences and references to where a cited passage is (its page, issue, file name or
+  regulation year, each compared with that kind of metadata of the passage) excepted.
 
 Anything else is replaced by the standard decline message, with the reason and
 the raw model output kept for inspection. The checks establish citation, identifier
@@ -29,12 +30,13 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from core_modules.rule_checker.fia_files import fia_issue, fia_section
 
 from .retrieval import RetrievedPassage
-from decimal import Decimal, InvalidOperation
-
-from .rules import extract_rule_ids, is_supported, item_letters
+from .rules import extract_rule_ids, is_supported, item_letters, rule_id_spans
 
 DECLINE_ANSWER = (
     "I cannot answer that from the indexed FIA regulations because the retrieved "
@@ -62,14 +64,20 @@ _PAREN_CITATION = re.compile(
 )
 # "excerpt 3 says", "according to source S2"
 _PROSE_CITATION = re.compile(rf"\b(?:excerpts?|sources?|passages?)\s+(S?\s*{_NUMBER})\b", re.IGNORECASE)
+# Each style and the part of a match that shows its labels: a prose citation keeps its word ("source S2").
+_CITATION_STYLES = ((_BRACKET_CITATION, 0), (_PAREN_CITATION, 0), (_PROSE_CITATION, 1))
 _MAX_RANGE = 50
 
+# An explicit inference marker at the start of a sentence, also inside an opening parenthesis
+# ("(Inference: the difference is ...)"), exempts that sentence from the citation and number checks.
 _INFERENCE_MARKER = re.compile(
-    r"^[\s*_>#-]*(?:thus|therefore|hence|so|consequently|this means|in other words|in summary|overall|"
+    r"^[\s*_>#(-]*(?:thus|therefore|hence|so|consequently|this means|in other words|in summary|overall|"
     r"inference|by inference|it follows)\b",
     re.IGNORECASE,
 )
 _HAS_NUMBER = re.compile(r"\d")
+# Where one sentence or list item ends: whitespace after ".", "!" or "?", or a line break.
+SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
 # Sentences about the limits of the supplied evidence, not about the regulations:
 # "The excerpts do not specify ...", "No excerpt covers ...", "This is not stated in the provided text."
 _EVIDENCE_WORD = re.compile(
@@ -102,6 +110,18 @@ _NUMBER_WORDS.update({"thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seve
                       "hundred": 100, "thousand": 1000, "half": 0.5})
 _NUMBER_WORD = re.compile(r"\b(" + "|".join(_NUMBER_WORDS) + r")\b", re.IGNORECASE)
 _LIST_MARKER = re.compile(r"(?m)^[ \t>*_-]*\(?\d{1,2}[.)](?=\s)")
+# Where a passage is, not what it says: "page 9", "p. 9", "PDF page 9", "printed page B9", "Issue 08" (capital I:
+# the verb "issue" is no reference), a PDF file name, and the year of a document ("the 2026 Sporting Regulations",
+# "Regulations 2026").
+_LOCATOR = re.compile(
+    r"(?P<page>\b(?:(?:pdf|printed)\s+)?(?:pages?|pp?\.)\s*[A-F]?\d{1,4}\b)"
+    r"|(?P<issue>\b(?-i:Iss(?:ue)?)\.?\s*\d{1,3}\b)"
+    r"|(?P<file>[\w.-]+\.pdf\b)"
+    r"|(?P<year>\b(?:19|20)\d\d(?=\s+(?:(?-i:[A-Z0-9][\w-]*)\s+){0,4}(?:regulations?|season|championship|edition)\b)"
+    r"|\b(?:regulations?|season|championship)\s+(?:19|20)\d\d\b)",
+    re.IGNORECASE,
+)
+_YEAR = re.compile(r"(?<!\d)(?:19|20)\d\d(?!\d)")
 
 
 class Outcome:
@@ -135,6 +155,8 @@ class ValidatedAnswer:
     unsupported_numbers: List[str] = field(default_factory=list)
     unverified_claims: List[str] = field(default_factory=list)
     model_output: Optional[str] = None
+    # The provider's finish_reason of a reply that stopped before it finished (TRUNCATED only).
+    finish_reason: Optional[str] = None
 
     @property
     def grounded(self) -> bool:
@@ -147,11 +169,25 @@ def label_passages(passages: Sequence[RetrievedPassage]) -> Dict[str, RetrievedP
     return {f"S{i}": passage for i, passage in enumerate(passages, start=1)}
 
 
+_BRACKETS = str.maketrans({"【": "[", "】": "]", "〔": "[", "〕": "]", "（": "(", "）": ")"})
+
+
 def _normalise(text: str) -> str:
     """Fold full-width brackets/digits (【S2】, ［S２］) to ASCII so every citation style is seen."""
 
-    text = unicodedata.normalize("NFKC", text)
-    return text.translate(str.maketrans({"【": "[", "】": "]", "〔": "[", "〕": "]", "（": "(", "）": ")"}))
+    return unicodedata.normalize("NFKC", text).translate(_BRACKETS)
+
+
+def _normalise_with_origins(text: str) -> Tuple[str, List[int]]:
+    """``_normalise`` applied character by character, and the offset in ``text`` of each resulting character."""
+
+    pieces: List[str] = []
+    origins: List[int] = []
+    for offset, char in enumerate(text):
+        piece = _normalise(char)
+        pieces.append(piece)
+        origins.extend([offset] * len(piece))
+    return "".join(pieces), origins
 
 
 def _labels_in(group: str) -> List[str]:
@@ -177,15 +213,51 @@ def _labels_in(group: str) -> List[str]:
     return labels
 
 
+def _citations(text: str) -> List[Tuple[int, int, int, List[str]]]:
+    """(start, end, start of the shown labels, labels) of every citation-like token, in text order.
+
+    Matching runs on the normalised text, so 【S2】 and ［Ｓ２］ are citations, and the offsets are mapped
+    back into ``text``. Overlapping matches count once, as the earliest and outermost one: "[Source S1]"
+    and "(source S1)" also contain the prose citation "source S1".
+    """
+
+    normalised, origins = _normalise_with_origins(text)
+    matches = sorted(
+        (
+            (origins[match.start()], origins[match.end() - 1] + 1, origins[match.start(shown)], match.group(1))
+            for pattern, shown in _CITATION_STYLES
+            for match in pattern.finditer(normalised)
+        ),
+        key=lambda match: (match[0], -match[1]),
+    )
+    citations: List[Tuple[int, int, int, List[str]]] = []
+    for start, end, shown_start, group in matches:
+        if not citations or start >= citations[-1][1]:
+            citations.append((start, end, shown_start, _labels_in(group)))
+    return citations
+
+
 def citation_spans(text: str) -> List[Tuple[int, int, List[str]]]:
-    """(start, end, labels) of every citation-like token, in text order."""
+    """(start, end, labels) of every citation-like token in ``text``, in text order, never overlapping."""
+
+    return [(start, end, labels) for start, end, _, labels in _citations(text)]
+
+
+def shown_citation_spans(text: str) -> List[Dict[str, Any]]:
+    """Where ``text`` shows each citation, for clients that mark them: ``start``/``end`` offsets into
+    ``text`` (the whole citation, or only the label of a prose citation such as "source S2") and the
+    ``labels`` it names, ranges expanded."""
+
+    return [{"start": start, "end": end, "labels": labels} for _, end, start, labels in _citations(text)]
+
+
+def _without_citations(text: str, replacement: str = "") -> str:
+    """``text`` normalised, with every citation replaced by ``replacement``."""
 
     text = _normalise(text)
-    spans = []
-    for pattern in (_BRACKET_CITATION, _PAREN_CITATION, _PROSE_CITATION):
-        for match in pattern.finditer(text):
-            spans.append((match.start(), match.end(), _labels_in(match.group(1))))
-    return sorted(spans)
+    for start, end, _ in reversed(citation_spans(text)):
+        text = text[:start] + replacement + text[end:]
+    return text
 
 
 def extract_citations(text: str) -> List[str]:
@@ -203,7 +275,7 @@ def _is_meta(sentence: str) -> bool:
     """A heading, list introduction or remark about the evidence rather than a regulatory statement."""
 
     stripped = sentence.strip(" \t*_#>")
-    if stripped.endswith(":") or stripped.endswith("?"):
+    if stripped.endswith((":", "?")):
         return not (_HAS_NUMBER.search(stripped) or extract_rule_ids(stripped))
     words = re.findall(r"[A-Za-z]+", stripped)
     if len(words) < _MIN_CLAIM_WORDS and not _HAS_NUMBER.search(stripped):
@@ -220,13 +292,9 @@ _BARE_MARKER = re.compile(r"\(?(?:\d{1,2}|[A-Za-z]|[ivxIVX]{1,4})")
 def _is_sources_block(block: str) -> bool:
     """A paragraph that consists only of citations, optionally labelled ("Sources: [S1][S3]")."""
 
-    spans = citation_spans(block)
-    if not spans:
+    if not citation_spans(block):
         return False
-    rest = _normalise(block)
-    for start, end, _ in reversed(spans):
-        rest = rest[:start] + rest[end:]
-    rest = _SOURCES_LABEL.sub(" ", rest)
+    rest = _SOURCES_LABEL.sub(" ", _without_citations(block))
     return not rest.strip(" \t\n.,;:*_-()[]")
 
 
@@ -254,7 +322,7 @@ def uncited_claims(text: str) -> List[str]:
         if not tail_stripped or _INFERENCE_MARKER.match(tail_stripped):
             continue
         # A trailing sentence may itself start with an inference marker after earlier cited text.
-        for sentence in re.split(r"(?<=[.!?])\s+|\n+", tail.strip()):
+        for sentence in SENTENCE_BREAK.split(tail.strip()):
             sentence = sentence.strip(" \t.,;)*_")
             if not sentence or _BARE_MARKER.fullmatch(sentence):
                 continue
@@ -292,34 +360,63 @@ def _numbers(text: str) -> Set[Decimal]:
     return values
 
 
-def _strip_non_quantities(text: str) -> str:
-    """Remove citation labels, list markers, rule identifiers and inference-marked sentences."""
+def _without_locators(text: str, cited: Sequence[RetrievedPassage]) -> str:
+    """Blank the references to where a cited passage is (page, issue, file name, regulation year).
 
-    for start, end, _ in reversed(citation_spans(text)):
-        text = text[:start] + " " + text[end:]
-    text = _LIST_MARKER.sub(" ", text)
+    Each reference is compared with its own kind of metadata of the cited passages: a page with
+    their page numbers and labels, an issue with the issue number in their file names, a year with
+    their regulation year, a file name with their file names. So "(page 9)" of a page-9 passage is
+    exempt from the number check, but "(page 99)", or a "5" taken from a file dated 2026-08-05, is not.
+    """
+
+    located: Dict[str, Set[Any]] = {"page": set(), "issue": set(), "file": set(), "year": set()}
+    for passage in cited:
+        for value in (passage.page_label, None if passage.page is None else str(passage.page)):
+            if value:
+                located["page"] |= _numbers(value)
+        issue = fia_issue(passage.source)
+        if issue is not None:
+            located["issue"].add(Decimal(issue))
+        located["file"].add(passage.source.lower())
+        # An official name's regulation year, not the year of its issue date; otherwise any year in the name.
+        official = fia_section(passage.source)
+        located["year"] |= {Decimal(year) for year in ([official[0]] if official else _YEAR.findall(passage.source))}
+
+    def blank(match: "re.Match[str]") -> str:
+        kind, reference = match.lastgroup or "", match.group(0)
+        exempt = reference.lower() in located["file"] if kind == "file" else _numbers(reference) <= located[kind]
+        return " " if exempt else reference
+
+    return _LOCATOR.sub(blank, text)
+
+
+def _strip_non_quantities(text: str) -> str:
+    """Remove citation labels, list markers, inference-marked sentences and numeric rule identifiers."""
+
+    text = _LIST_MARKER.sub(" ", _without_citations(text, " "))
     kept = []
-    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+    for sentence in SENTENCE_BREAK.split(text):
         if not _INFERENCE_MARKER.match(sentence.strip(" \t*_#>")):
             kept.append(sentence)
+    # Identifiers split after a dot are not joined here: "under Article B1.6. 3 penalty points" states a 3.
     text = " ".join(kept)
-    for rule in sorted(extract_rule_ids(text), key=len, reverse=True):
-        # Purely numeric identifiers ("Article 34.7") look like quantities; letter-prefixed
-        # ones ("B1.6.3", "Appendix B2") are never read as numbers in the first place.
-        identifier = rule.split()[-1]
-        if identifier[:1].isdigit():
-            identifier = re.sub(r"\.?[a-z]$", "", identifier)
-            text = re.sub(rf"(?<![\d.,]){re.escape(identifier)}(?![\d])", " ", text)
+    for start, end, rule in rule_id_spans(text):
+        # Purely numeric identifiers ("Article 34.7") look like quantities; letter-prefixed ones ("B1.6.3",
+        # "Appendix B2") are never read as numbers. Only the identifier itself is blanked, so the "12" of
+        # "Article 12 ... a 12 place grid penalty" is still checked.
+        if rule.split()[-1][:1].isdigit():
+            text = text[:start] + " " * (end - start) + text[end:]
     return text
 
 
 def passage_numbers(passages: Sequence[RetrievedPassage]) -> Set[Decimal]:
+    """Numbers stated by the passages' text (and their nearest rule heading), not by their metadata."""
+
     values: Set[Decimal] = set()
     for passage in passages:
         values |= _numbers(passage.text)
-        for extra in (passage.source, passage.page_label, passage.nearest_rule, str(passage.page or "")):
-            if extra:
-                values |= _numbers(extra)
+        if passage.nearest_rule:
+            values |= _numbers(passage.nearest_rule)
     return values
 
 
@@ -327,7 +424,7 @@ def unsupported_numbers(text: str, cited: Sequence[RetrievedPassage]) -> List[st
     """Numbers stated in the answer that do not occur in any cited passage."""
 
     evidence = passage_numbers(cited)
-    stripped = _strip_non_quantities(_normalise(text))
+    stripped = _strip_non_quantities(_without_locators(_normalise(text), cited))
     missing: List[str] = []
     for match in _NUMBER_TOKEN.finditer(stripped):
         values = _token_values(stripped, match)
@@ -350,15 +447,20 @@ def declined(reason: str, model_output: Optional[str] = None, **details) -> Vali
     return ValidatedAnswer(status=Outcome.DECLINED, answer=DECLINE_ANSWER, reason=reason, model_output=model_output, **details)
 
 
+def _folded(text: str) -> str:
+    """Lower case, with runs of whitespace, punctuation and emphasis as single spaces."""
+
+    return re.sub(r"[\s.,;:!*_\-]+", " ", text).strip().lower()
+
+
+_FOLDED_DECLINE = _folded(DECLINE_ANSWER)
+
+
 def _is_decline(text: str) -> bool:
     if _SENTINEL.search(text):
         return True
-    without_citations = text
-    for start, end, _ in reversed(citation_spans(text)):
-        without_citations = without_citations[:start] + without_citations[end:]
-    core = re.sub(r"[\s.,;:!*_\-]+", " ", _normalise(without_citations)).strip().lower()
-    decline = re.sub(r"[\s.,;:!*_\-]+", " ", DECLINE_ANSWER).strip().lower()
-    return bool(_DECLINE_ONLY.match(core)) or decline in core
+    core = _folded(_without_citations(text))
+    return bool(_DECLINE_ONLY.match(core)) or _FOLDED_DECLINE in core
 
 
 def validate_answer(model_output: str, labelled: Dict[str, RetrievedPassage]) -> ValidatedAnswer:

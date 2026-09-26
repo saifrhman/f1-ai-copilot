@@ -3,11 +3,12 @@
 ``StrategyRequest`` is meant to be used directly as a FastAPI request body and by the
 natural-language router (``StrategyRequest.from_context``). Invalid input raises
 ``pydantic.ValidationError`` (a ``ValueError`` subclass); the engine raises ``ValueError``.
+Cross-field rules call the engine's and the calibration's ``check_*`` functions, so each rule
+and its message live in one place.
 
-    request = StrategyRequest.model_validate(payload)
-    result = generate_strategy(**request.to_engine_inputs())
-    body = strategy_result_to_dict(result)
+    body = generate_strategy_response(StrategyRequest.model_validate(payload))
 
+(``strategy_result_to_dict`` serialises a ``StrategyResult`` from ``generate_strategy``.)
 ``TyreCalibrationRequest`` is the body for estimating ``tire_data`` from lap history:
 
     body = calibrate_tyres_response(TyreCalibrationRequest.model_validate(payload))
@@ -21,13 +22,14 @@ from typing import Annotated, Any, Dict, List, Mapping, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from .calibration import (
-    LAP_FLAGS,
     MAX_CALIBRATION_LAPS,
     MAX_FUEL_CORRECTION_S_PER_LAP,
     CompoundCalibration,
     ExcludedLap,
     LapRecord,
     TyreCalibrationResult,
+    check_fuel_race_laps,
+    check_override_has_laps,
     estimate_tire_parameters,
 )
 from .strategy_engine import (
@@ -64,6 +66,13 @@ from .strategy_engine import (
     TireCompound,
     TireData,
     WeatherCondition,
+    check_current_compound_has_tire_data,
+    check_driver_value_supplied,
+    check_fitted_tyre_pair,
+    check_lap_range,
+    check_peak_window_order,
+    check_tire_key,
+    check_unique_driver_ids,
     generate_strategy,
 )
 
@@ -207,9 +216,7 @@ class TireDataInput(BaseModel):
 
     @model_validator(mode="after")
     def _window_order(self) -> "TireDataInput":
-        start, end = self.peak_performance_window
-        if start > end:
-            raise ValueError(f"peak_performance_window start ({start}) must be <= end ({end})")
+        check_peak_window_order(*self.peak_performance_window)
         return self
 
 
@@ -250,10 +257,8 @@ class RaceStateInput(BaseModel):
 
     @model_validator(mode="after")
     def _consistency(self) -> "RaceStateInput":
-        if self.current_lap > self.total_laps:
-            raise ValueError(f"current_lap ({self.current_lap}) must be <= total_laps ({self.total_laps})")
-        if (self.current_compound is None) != (self.current_tire_age is None):
-            raise ValueError("current_compound and current_tire_age must be given together")
+        check_lap_range(self.current_lap, self.total_laps)
+        check_fitted_tyre_pair(self.current_compound, self.current_tire_age)
         return self
 
 
@@ -322,17 +327,12 @@ class StrategyRequest(BaseModel):
     @model_validator(mode="after")
     def _cross_checks(self) -> "StrategyRequest":
         for key, tire in self.tire_data.items():
-            if tire.compound is not None and tire.compound != key:
-                raise ValueError(f"tire_data key '{key.value}' does not match its compound '{tire.compound.value}'")
-        current = self.race_state.current_compound
-        if current is not None and current not in self.tire_data:
-            raise ValueError(f"race_state.current_compound '{current.value}' needs an entry in tire_data")
-        ids = [rival.driver_id for rival in self.competition]
-        if len(ids) != len(set(ids)):
-            raise ValueError("competition driver_id values must be unique")
+            if tire.compound is not None:
+                check_tire_key(key, tire.compound)
+        check_current_compound_has_tire_data(self.race_state.current_compound, self.tire_data)
+        check_unique_driver_ids([rival.driver_id for rival in self.competition])
         for name in DRIVER_OVERRIDE_KEYS:
-            if getattr(self.telemetry, name) is None and getattr(self.driver_profile, name) is None:
-                raise ValueError(f"{name} is required: supply telemetry.{name} or driver_profile.{name}")
+            check_driver_value_supplied(name, getattr(self.telemetry, name), getattr(self.driver_profile, name))
         return self
 
     @classmethod
@@ -627,18 +627,8 @@ class TyreCalibrationRequest(BaseModel):
         present = {lap.compound for lap in self.laps}
         for name in ("peak_window_end", "warm_up_laps"):
             for compound in getattr(self, name) or {}:
-                if compound not in present:
-                    raise ValueError(f"{name} is given for '{compound.value}', which has no laps")
-        if self.fuel_correction_s_per_lap > 0.0:
-            missing = [
-                index
-                for index, lap in enumerate(self.laps)
-                if lap.race_lap is None and not any(getattr(lap, flag) for flag in LAP_FLAGS)
-            ]
-            if missing:
-                raise ValueError(
-                    f"fuel_correction_s_per_lap needs race_lap on every unflagged lap; missing on laps{missing[:10]}"
-                )
+                check_override_has_laps(name, compound, present)
+        check_fuel_race_laps(self.laps, self.fuel_correction_s_per_lap)
         return self
 
     def to_calibration_inputs(self) -> Dict[str, Any]:

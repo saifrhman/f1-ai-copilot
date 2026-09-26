@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,11 +33,16 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 
-FIA_BASE_URL = "https://www.fia.com"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Standard library only: the discovery CI job installs just requests and pypdf.
+from core_modules.rule_checker.fia_files import MANIFEST_NAME, fia_issue, fia_section  # noqa: E402
+
 DEFAULT_CATEGORY_URL = "https://www.fia.com/regulation/category/2182"
 DEFAULT_SECTIONS = ("A", "B", "C", "D", "E", "F")
 USER_AGENT = "f1-ai-copilot/1.2 (local FIA regulation downloader)"
-MANIFEST_NAME = "manifest.json"
 MAX_PDF_BYTES = 100 * 1024 * 1024
 
 
@@ -60,26 +66,16 @@ def _filename_from_url(url: str) -> str:
 
 
 def _section_from_url(url: str, year: int) -> Optional[str]:
-    """Section letter of an official "FIA <year> F1 Regulations - Section X" file name.
+    """Section letter of an official FIA regulation file of ``year`` (see ``fia_files.fia_section``)."""
 
-    The year must be the regulation-year prefix of the file name; dates elsewhere
-    in the name (issue dates) never count, so a 2027 document issued in 2026 is
-    not mistaken for a 2026 regulation.
-    """
-
-    name = html.unescape(unquote(Path(urlparse(url).path).name)).lower()
-    match = re.match(
-        rf"fia[_ -]*{year}[_ -]*(?:f1|formula[_ -]*1)[_ -]*regulations[_ -]*-?[_ -]*section[_ -]*([a-f])(?![a-z])",
-        name,
-    )
-    return match.group(1).upper() if match else None
+    found = fia_section(html.unescape(unquote(Path(urlparse(url).path).name)), year)
+    return found[1] if found else None
 
 
 def _issue_and_date(url: str) -> Tuple[Optional[int], Optional[str]]:
     name = unquote(urlparse(url).path).lower()
-    issue = re.search(r"iss(?:ue)?[_ -]?0*(\d{1,3})(?!\d)", name)
     date = re.findall(r"(20\d\d-\d\d-\d\d)", name)
-    return (int(issue.group(1)) if issue else None, date[-1] if date else None)
+    return fia_issue(name), date[-1] if date else None
 
 
 def discover_candidates(category_html: str, category_url: str, year: int) -> List[Candidate]:
@@ -102,15 +98,15 @@ def discover_candidates(category_html: str, category_url: str, year: int) -> Lis
     return candidates
 
 
-def discover_pdf_urls(category_html: str, category_url: str, year: int) -> Dict[str, str]:
-    """Latest issue URL for each A-F section found on the category page."""
+def latest_candidates(candidates: Iterable[Candidate]) -> Dict[str, Candidate]:
+    """The newest issue among ``candidates`` for each section (see ``Candidate.rank``)."""
 
     latest: Dict[str, Candidate] = {}
-    for candidate in discover_candidates(category_html, category_url, year):
+    for candidate in candidates:
         current = latest.get(candidate.section)
         if current is None or candidate.rank > current.rank:
             latest[candidate.section] = candidate
-    return {section: candidate.url for section, candidate in latest.items()}
+    return latest
 
 
 def validate_pdf_bytes(content: bytes, url: str, content_type: Optional[str] = None) -> int:
@@ -195,35 +191,34 @@ def fetch_regulations(
     category_response = session.get(category_url, timeout=60)
     category_response.raise_for_status()
     candidates = discover_candidates(category_response.text, category_response.url, year)
-    discovered = discover_pdf_urls(category_response.text, category_response.url, year)
+    latest = latest_candidates(candidates)
 
     requested = list(dict.fromkeys(section.upper() for section in sections))
-    missing = [section for section in requested if section not in discovered]
+    missing = [section for section in requested if section not in latest]
     if missing:
         raise RuntimeError(
             "Could not discover official FIA PDF links for section(s): "
             + ", ".join(missing)
             + ". The FIA page structure may have changed."
         )
-    filenames = {section: _filename_from_url(discovered[section]) for section in requested}
+    filenames = {section: _filename_from_url(latest[section].url) for section in requested}
     if len(set(filenames.values())) != len(filenames):
         raise RuntimeError(f"Two sections resolved to the same file name: {filenames}")
 
     entries: List[Dict[str, object]] = []
     for section in requested:
-        url = discovered[section]
-        issue, date = _issue_and_date(url)
+        chosen = latest[section]
         entries.append(
             {
                 "section": section,
                 "year": year,
-                "issue": issue,
-                "issue_date": date,
+                "issue": chosen.issue,
+                "issue_date": chosen.date,
                 "source_category": category_response.url,
-                "source_url": url,
+                "source_url": chosen.url,
                 "filename": filenames[section],
                 "superseded_issues_on_page": sorted(
-                    c.url for c in candidates if c.section == section and c.url != url
+                    c.url for c in candidates if c.section == section and c.url != chosen.url
                 ),
             }
         )
@@ -278,16 +273,15 @@ def fetch_regulations(
 def _default_output() -> Path:
     """FIA_DOCS_PATH (from the environment or .env), resolved like the RAG resolves it."""
 
-    root = Path(__file__).resolve().parents[1]
     if os.getenv("F1_COPILOT_LOAD_DOTENV", "1") != "0":
         try:
             from dotenv import load_dotenv
 
-            load_dotenv(root / ".env")
+            load_dotenv(PROJECT_ROOT / ".env")
         except ImportError:  # the discovery-only CI job installs just requests and pypdf
             pass
     configured = Path(os.getenv("FIA_DOCS_PATH") or "data/fia_docs").expanduser()
-    return configured if configured.is_absolute() else root / configured
+    return configured if configured.is_absolute() else PROJECT_ROOT / configured
 
 
 def main() -> int:

@@ -36,9 +36,10 @@ class ProviderError(RAGUnavailableError):
 
 
 _SECRET = re.compile(r"(sk-[A-Za-z0-9_\-*]{2}|Bearer\s+)[A-Za-z0-9_\-*.]{4,}")
+_MAX_MESSAGE_CHARS = 300
 
 
-def describe_provider_error(exc: BaseException, limit: int = 300) -> str:
+def describe_provider_error(exc: BaseException) -> str:
     """Short, secret-free description of a provider/SDK exception for logs and API responses."""
 
     name = type(exc).__name__
@@ -46,6 +47,6 @@ def describe_provider_error(exc: BaseException, limit: int = 300) -> str:
     if status in (401, 403):
         return f"{name} (HTTP {status}): the provider rejected the credentials"
     message = _SECRET.sub(lambda m: m.group(1) + "***", str(exc).strip() or name)
-    if len(message) > limit:
-        message = message[:limit] + "..."
+    if len(message) > _MAX_MESSAGE_CHARS:
+        message = message[:_MAX_MESSAGE_CHARS] + "..."
     return f"{name} (HTTP {status}): {message}" if status else f"{name}: {message}"

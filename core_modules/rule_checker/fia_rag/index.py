@@ -216,7 +216,7 @@ class QdrantIndex:
         finally:
             if not published:
                 self._discard(alias, backing)
-        if previous is not None and previous != backing:
+        if previous is not None:
             try:
                 self.client.delete_collection(previous)
             except _QDRANT_ERRORS as exc:
@@ -279,15 +279,19 @@ class QdrantIndex:
     def glossary_collection(self) -> str:
         return f"{self.collection}_glossary"
 
-    def rebuild_glossary(self, entries: Sequence[GlossaryEntry], fingerprint: str) -> int:
-        """Store the definitions glossary (no embeddings: points carry a constant 1-d vector)."""
+    def rebuild_glossary(self, entries: Sequence[GlossaryEntry], key: str) -> int:
+        """Store the definitions glossary under ``key`` (no embeddings: points carry a constant 1-d vector).
+
+        ``key`` identifies the inputs the glossary was built from (index fingerprint and glossary version).
+        It is stored in the ``index_fingerprint`` payload field, like the chunk index's fingerprint.
+        """
 
         name = self.glossary_collection
         points = [
             models.PointStruct(
-                id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{fingerprint}:{entry.source}:{entry.term}:{index}")),
+                id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{key}:{entry.source}:{entry.term}:{index}")),
                 vector=[1.0],
-                payload={**entry.to_payload(), "index_fingerprint": fingerprint},
+                payload={**entry.to_payload(), "index_fingerprint": key},
             )
             for index, entry in enumerate(entries)
         ]
@@ -295,7 +299,7 @@ class QdrantIndex:
             models.PointStruct(
                 id=_GLOSSARY_META_ID,
                 vector=[1.0],
-                payload={"meta": True, "index_fingerprint": fingerprint, "index_entry_count": len(entries)},
+                payload={"meta": True, "index_fingerprint": key, "index_entry_count": len(entries)},
             )
         )
         with self._lock:
@@ -308,8 +312,8 @@ class QdrantIndex:
                 raise VectorStoreError(f"Qdrant glossary indexing into {name!r} failed: {exc}") from exc
         return len(entries)
 
-    def load_glossary(self, fingerprint: str) -> Optional[List[GlossaryEntry]]:
-        """The stored glossary if it was built from the same inputs and is complete, else None."""
+    def load_glossary(self, key: str) -> Optional[List[GlossaryEntry]]:
+        """The glossary stored under ``key`` (see ``rebuild_glossary``) if it is complete, else None."""
 
         name = self.glossary_collection
         with self._lock:
@@ -317,7 +321,7 @@ class QdrantIndex:
                 if not self.client.collection_exists(name):
                     return None
                 meta = self.client.retrieve(name, ids=[_GLOSSARY_META_ID], with_payload=True)
-                if not meta or (meta[0].payload or {}).get("index_fingerprint") != fingerprint:
+                if not meta or (meta[0].payload or {}).get("index_fingerprint") != key:
                     return None
                 expected = int((meta[0].payload or {}).get("index_entry_count", -1))
                 entries: List[GlossaryEntry] = []
@@ -326,7 +330,7 @@ class QdrantIndex:
                     batch, offset = self.client.scroll(name, limit=512, offset=offset, with_payload=True, with_vectors=False)
                     for point in batch:
                         payload = point.payload or {}
-                        if not payload.get("meta") and payload.get("index_fingerprint") == fingerprint:
+                        if not payload.get("meta") and payload.get("index_fingerprint") == key:
                             entries.append(GlossaryEntry.from_payload(payload))
                     if offset is None:
                         break

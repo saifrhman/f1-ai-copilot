@@ -1,4 +1,5 @@
-"""Test helpers: real PDF files, a deterministic lexical embedder and a scripted chat model.
+"""Test helpers: real PDF files, a deterministic lexical embedder, a scripted chat model, and the
+generated regulation corpora and pipelines the RAG, API and UI tests share.
 
 Only the two network services (embedding API, chat API) are replaced in tests.
 PDF parsing, chunking, Qdrant indexing/search and answer validation are real.
@@ -10,10 +11,21 @@ import hashlib
 import math
 import re
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessage
+from qdrant_client import QdrantClient
+
+from core_modules.rule_checker.fia_rag import (
+    ChunkingConfig,
+    EmbeddingConfig,
+    FIARegulationRAG,
+    GenerationConfig,
+    QdrantConfig,
+    RAGSettings,
+    RetrievalConfig,
+)
 
 PageSpec = Union[str, Sequence[str], None]
 
@@ -148,3 +160,109 @@ FIA_STYLE_HEADER = (
 
 def fia_page(page: int, body: str) -> str:
     return FIA_STYLE_HEADER.format(page=page) + "\n" + body
+
+
+# ------------------------------------------------------------------ regulation corpus and pipeline
+
+PIT_LANE = (
+    "B1.6 Pit Lane Speed\nB1.6.3 Driving in the Pit Entry Road, Pit Lane and Pit Exit Road "
+    "a. A speed limit of 80km/h will be imposed in the pit lane during all sessions."
+)
+UNSAFE_RELEASE = (
+    "B4.2 Unsafe Release\nB4.2.1 A car must not be released from its pit stop position in an unsafe "
+    "condition. Competitors are responsible for releasing cars only when it is safe."
+)
+FUEL_FLOW = "C5.4 Fuel Flow\nC5.4.2 The fuel mass flow must not exceed one hundred kilograms per hour above 10500 rpm."
+REAR_WING = "C3.9 Rear Wing\nC3.9.1 The rear wing flap position may be adjusted by the driver only when the adjustable wing is enabled."
+
+
+def write_regulation_corpus(folder: Path) -> Path:
+    """Two regulation PDFs: Section B (pit lane, a blank page, unsafe release) and Section C (fuel flow, rear wing)."""
+
+    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_LANE), None, fia_page(3, UNSAFE_RELEASE)])
+    write_pdf(folder / "section_c_technical.pdf", [FUEL_FLOW, REAR_WING])
+    return folder
+
+
+def cite_passage_containing(needle, template="{claim} [{label}]."):
+    """A well-behaved model: cites the excerpt that actually contains the fact."""
+
+    def responder(messages):
+        user = messages[1].content
+        for match in re.finditer(r'<excerpt label="(S\d+)"[^>]*>\n(.*?)\n</excerpt>', user, re.DOTALL):
+            if needle in match.group(2):
+                return template.format(claim=f"The regulations state: {needle}", label=match.group(1))
+        return "INSUFFICIENT_EVIDENCE"
+
+    return responder
+
+
+def rag_settings(docs_path: Path, **overrides: Any) -> RAGSettings:
+    """The test pipelines' settings: 400-character chunks, hashing embeddings, the top 4 passages above 0.2.
+
+    ``overrides`` replace whole settings objects (``retrieval=RetrievalConfig(...)``, ``qdrant=...``).
+    """
+
+    values: Dict[str, Any] = {
+        "docs_path": docs_path,
+        "chunking": ChunkingConfig(chunk_size=400, chunk_overlap=40),
+        "embedding": EmbeddingConfig(model="hashing-test-512", batch_size=8),
+        "retrieval": RetrievalConfig(top_k=4, min_score=0.2),
+        "qdrant": QdrantConfig(collection="test"),
+    }
+    return RAGSettings(**{**values, **overrides})
+
+
+def build_test_rag(docs_path: Path, reply=None) -> Tuple[FIARegulationRAG, ScriptedChatModel, QdrantClient]:
+    """A real pipeline over ``write_regulation_corpus``; the index is NOT built yet (call ``build_index``).
+
+    The scripted model answers pit-lane questions by citing the passage containing "80km/h" unless
+    ``reply`` (a string or ``messages -> str``) is given. The caller closes the returned Qdrant client.
+    """
+
+    llm = ScriptedChatModel(reply if reply is not None else cite_passage_containing("80km/h"))
+    qdrant = QdrantClient(":memory:")
+    rag = FIARegulationRAG(
+        rag_settings(write_regulation_corpus(docs_path)), embeddings=HashingEmbeddings(), llm=llm, qdrant_client=qdrant
+    )
+    return rag, llm, qdrant
+
+
+# ------------------------------------------------------------------ definitions corpus and pipeline
+
+PIT_PENALTY = (
+    "B1.6 Pit Lane Speed\nB1.6.4 Speeding in the pit lane during a TTCS will be penalised with a drive through "
+    "penalty. Speeding in the pit lane during an LTCS will be penalised with a fine."
+)
+DEFINITIONS = (
+    "APPENDIX B1 DEFINITIONS\n"
+    "“Total Time Classified Session” (or “TTCS”) is any track running session during which the "
+    "classification is determined by the total time taken. Total Time Classified Sessions include the Sprint "
+    "session and the Race session.\n"
+    "“Lap Time Classified Session” (or “LTCS”) is any session classified by the fastest lap "
+    "time of each driver, such as Qualifying.\n"
+    "“Official” means any of the persons listed in the Code.\n"
+    "“Cost Cap” has the meaning set out in Article D4.1.2."
+)
+DEFINITIONS_QUESTION = "What happens when speeding in the pit lane?"
+
+
+def write_definitions_corpus(folder: Path) -> Path:
+    """One Section B PDF: a pit-lane penalty that uses TTCS and LTCS (page 1) and their definitions (page 85)."""
+
+    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_PENALTY), fia_page(85, DEFINITIONS)])
+    return folder
+
+
+def make_definitions_rag(docs, tmp_path, qdrant, llm=None, embeddings=None, max_definitions=3, verify=False):
+    """A pipeline over ``write_definitions_corpus`` that retrieves one passage and adds its definitions."""
+
+    settings = RAGSettings(
+        docs_path=docs,
+        chunking=ChunkingConfig(chunk_size=400, chunk_overlap=0),
+        embedding=EmbeddingConfig(model="hashing-test-512"),
+        retrieval=RetrievalConfig(top_k=1, min_score=0.1, max_definitions=max_definitions),
+        generation=GenerationConfig(verify_claims=verify),
+        qdrant=QdrantConfig(collection="fia_test", path=tmp_path / "qdrant"),
+    )
+    return FIARegulationRAG(settings, embeddings=embeddings or HashingEmbeddings(), llm=llm, qdrant_client=qdrant)

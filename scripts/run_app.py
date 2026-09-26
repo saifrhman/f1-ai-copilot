@@ -15,6 +15,7 @@ servers also stop when the launcher itself is killed (e.g. ``kill -9``).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import errno
 import json
@@ -213,10 +214,8 @@ def stop(children: Dict[str, subprocess.Popen], timeout: float) -> None:
 
     for process in children.values():
         if process.poll() is None:
-            try:
+            with contextlib.suppress(OSError):  # exited in the meantime
                 process.send_signal(signal.CTRL_BREAK_EVENT if IS_WINDOWS else signal.SIGTERM)
-            except OSError:  # exited in the meantime
-                pass
     deadline = time.monotonic() + timeout
     for name, process in children.items():
         try:

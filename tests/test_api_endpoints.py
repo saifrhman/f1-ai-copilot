@@ -10,22 +10,19 @@ import numpy as np
 import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
-from qdrant_client import QdrantClient
 
+import app.main as main
 import core_modules.rule_checker.fia_rag.pipeline as rag_pipeline
-from app.main import app
-from core_modules.rule_checker.fia_rag import (
-    DECLINE_ANSWER,
-    ChunkingConfig,
-    EmbeddingConfig,
-    FIARegulationRAG,
-    QdrantConfig,
-    RAGSettings,
-    RetrievalConfig,
+from app.main import DEFAULT_BODY_LIMIT, ROUTE_BODY_LIMITS, app
+from core_modules.driver_emotion.emotion_classifier import TranscriptionError
+from core_modules.rule_checker.fia_rag import DECLINE_ANSWER
+from core_modules.setup_optimizer.schemas import SetupRequest
+from tests.helpers import (
+    DEFINITIONS_QUESTION,
+    ScriptedChatModel,
+    make_definitions_rag,
+    write_definitions_corpus,
 )
-from tests.helpers import HashingEmbeddings, ScriptedChatModel, fia_page, write_pdf
-from tests.test_fia_generation import cite_passage_containing
-from tests.test_fia_index_retrieval import FUEL_FLOW, PIT_LANE, REAR_WING, UNSAFE_RELEASE
 
 client = TestClient(app)
 
@@ -67,38 +64,8 @@ STRATEGY_REQUEST = {
     "competition": [{"driver_id": "HAM", "tire_compound": "medium", "tire_age": 21, "gap_to_leader": 4.4}],
 }
 
-SETUP_REQUEST = {
-    "driver_preferences": {"risk_tolerance": 0.5, "tire_management": 0.7},
-    "track_profile": {
-        "track_name": "Silverstone Circuit", "track_length": 5891, "corners": 18, "high_speed_sections": 8,
-        "low_speed_sections": 4, "track_type": "high_speed", "average_speed": 220, "downforce_requirement": 0.6,
-    },
-    "weather": {"condition": "dry", "temperature": 24, "humidity": 50},
-    "n_trials": 24,
-    "seed": 7,
-}
-
-
-@pytest.fixture
-def configured_rag(tmp_path, monkeypatch):
-    """Replace the process-wide pipeline with a real one over generated PDFs (only the model APIs are scripted)."""
-
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_LANE), None, fia_page(3, UNSAFE_RELEASE)])
-    write_pdf(folder / "section_c_technical.pdf", [FUEL_FLOW, REAR_WING])
-    settings = RAGSettings(
-        docs_path=folder,
-        chunking=ChunkingConfig(chunk_size=400, chunk_overlap=40),
-        embedding=EmbeddingConfig(model="hashing-test-512", batch_size=8),
-        retrieval=RetrievalConfig(top_k=4, min_score=0.2),
-        qdrant=QdrantConfig(collection="api_test"),
-    )
-    llm = ScriptedChatModel(cite_passage_containing("80km/h"))
-    qdrant = QdrantClient(":memory:")
-    rag = FIARegulationRAG(settings, embeddings=HashingEmbeddings(), llm=llm, qdrant_client=qdrant)
-    monkeypatch.setattr(rag_pipeline, "_instance", rag)
-    yield rag, llm
-    qdrant.close()
+# The documented request example with a small trial budget.
+SETUP_REQUEST = {**copy.deepcopy(SetupRequest.model_config["json_schema_extra"]["examples"][0]), "n_trials": 24, "seed": 7}
 
 
 # ------------------------------------------------------------------ service endpoints
@@ -129,8 +96,8 @@ def test_health_survives_invalid_rag_settings(monkeypatch):
     assert response.status_code == 503 and "FIA_RAG_TOP_K" in response.json()["detail"]
 
 
-def test_health_is_healthy_when_the_index_is_current(configured_rag):
-    rag, _ = configured_rag
+def test_health_is_healthy_when_the_index_is_current(installed_rag):
+    rag, _ = installed_rag
     assert client.get("/health").json()["modules"]["fia_rag"] == "index_missing"
     rag.build_index()
     body = client.get("/health").json()
@@ -145,14 +112,33 @@ def test_cors_allows_any_origin_without_credentials():
     assert "access-control-allow-credentials" not in response.headers
 
 
-def test_oversized_body_is_rejected_before_parsing():
-    response = client.post("/api/penalty/predict", content=b"x" * (40 * 1024 * 1024 + 1), headers={"content-type": "application/json"})
+MIB = 1024 * 1024
+# The body limits the README documents: audio routes, ghost telemetry, and one route with the default.
+DOCUMENTED_BODY_LIMITS = {
+    "/api/emotion/classify": 40 * MIB,
+    "/api/query/natural": 40 * MIB,
+    "/api/ghost/generate": 8 * MIB,
+    "/api/penalty/predict": MIB,
+}
+
+
+@pytest.mark.parametrize("route, limit", DOCUMENTED_BODY_LIMITS.items())
+def test_each_route_rejects_a_streamed_body_one_byte_over_its_limit(route, limit):
+    assert set(ROUTE_BODY_LIMITS) < set(DOCUMENTED_BODY_LIMITS)  # every route with its own limit is covered
+    assert ROUTE_BODY_LIMITS.get(route, DEFAULT_BODY_LIMIT) == limit
+
+    def body():  # streamed in 1 MiB chunks, never held at once
+        remaining = limit + 1
+        while remaining:
+            chunk = min(remaining, MIB)
+            remaining -= chunk
+            yield b"x" * chunk
+
+    response = client.post(route, content=body(), headers={"content-type": "application/json"})
     assert response.status_code == 413
 
 
 def test_unexpected_errors_are_json_500s_without_internals(monkeypatch):
-    import app.main as main
-
     def broken(**_):
         raise KeyError("internal detail")
 
@@ -182,13 +168,13 @@ def test_fia_query_validation(payload):
     assert client.post("/api/fia/query", json=payload).status_code == 422
 
 
-def test_fia_query_with_missing_index_is_503(configured_rag):
+def test_fia_query_with_missing_index_is_503(installed_rag):
     response = client.post("/api/fia/query", json={"question": "What is the pit lane speed limit?"})
     assert response.status_code == 503 and "build_fia_index.py" in response.json()["detail"]
 
 
-def test_fia_query_returns_validated_citations_mapped_to_passages(configured_rag):
-    rag, llm = configured_rag
+def test_fia_query_returns_validated_citations_mapped_to_passages(installed_rag):
+    rag, llm = installed_rag
     rag.build_index()
     body = client.post("/api/fia/query", json={"question": "What is the speed limit in the pit lane?"}).json()
     assert body["grounded"] is True and body["status"] == "answered"
@@ -198,38 +184,38 @@ def test_fia_query_returns_validated_citations_mapped_to_passages(configured_rag
     assert cited["cited"] and "80km/h" in cited["text"]
     assert (cited["source"], cited["page"], cited["page_label"], cited["section"]) == ("section_b_sporting.pdf", 1, "B1", None)
     assert len(llm.calls) == 1
+    # Citation spans are offsets into the returned answer, also where normalising would change its length.
+    llm.reply = "In the ﬁrst session the pit lane limit is 80km/h ［Ｓ１］."
+    body = client.post("/api/fia/query", json={"question": "What is the speed limit in the pit lane?"}).json()
+    assert body["grounded"] and body["answer"] == llm.reply
+    assert [(body["answer"][s["start"] : s["end"]], s["labels"]) for s in body["citation_spans"]] == [("［Ｓ１］", ["S1"])]
 
 
-def test_fia_query_declines_fabricated_citation(configured_rag):
-    rag, llm = configured_rag
+def test_fia_query_declines_fabricated_citation(installed_rag):
+    rag, llm = installed_rag
     rag.build_index()
     llm.reply = "The limit is 80km/h according to Article B9.9 [S9]."
     body = client.post("/api/fia/query", json={"question": "What is the speed limit in the pit lane?"}).json()
     assert body["grounded"] is False and body["answer"] == DECLINE_ANSWER
     assert body["decline_reason"] == "invalid_citation" and body["validation"]["invalid_citations"] == ["S9"]
+    assert body["citations"] == [] and body["citation_spans"] == []
 
 
-def test_fia_endpoints_expose_definition_passages(tmp_path, monkeypatch):
-    from tests.test_fia_evidence_checks import PIT_PENALTY, DEFINITIONS, QUESTION, make_rag
-
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_PENALTY), fia_page(85, DEFINITIONS)])
+def test_fia_endpoints_expose_definition_passages(tmp_path, monkeypatch, qdrant):
     llm = ScriptedChatModel("Speeding in the pit lane during a TTCS gives a drive through penalty [S1]; TTCS include the Race session [S2].")
-    qdrant = QdrantClient(":memory:")
-    rag = make_rag(folder, tmp_path, qdrant, llm=llm)
+    rag = make_definitions_rag(write_definitions_corpus(tmp_path / "fia_docs"), tmp_path, qdrant, llm=llm)
     rag.build_index()
     monkeypatch.setattr(rag_pipeline, "_instance", rag)
-    body = client.post("/api/fia/query", json={"question": QUESTION}).json()
+    body = client.post("/api/fia/query", json={"question": DEFINITIONS_QUESTION}).json()
     assert body["grounded"] and body["retrieved_passages"][1]["kind"] == "definition"
     assert body["retrieved_passages"][1]["defined_term"] == "Total Time Classified Session (TTCS)"
     assert body["retrieved_passages"][0]["kind"] == "regulation" and body["retrieved_passages"][0]["defined_term"] is None
-    retrieved = client.post("/api/fia/retrieve", json={"question": QUESTION}).json()
+    retrieved = client.post("/api/fia/retrieve", json={"question": DEFINITIONS_QUESTION}).json()
     assert retrieved["definitions"][0]["kind"] == "definition"
-    qdrant.close()
 
 
-def test_fia_retrieve_is_independent_of_generation(configured_rag):
-    rag, llm = configured_rag
+def test_fia_retrieve_is_independent_of_generation(installed_rag):
+    rag, llm = installed_rag
     rag.build_index()
     body = client.post("/api/fia/retrieve", json={"question": "pit lane speed limit", "top_k": 2, "min_score": 0.0}).json()
     assert len(body["passages"]) == 2 and body["top_k"] == 2
@@ -237,8 +223,8 @@ def test_fia_retrieve_is_independent_of_generation(configured_rag):
     assert llm.calls == []
 
 
-def test_regulatory_natural_query_uses_the_rag(configured_rag):
-    rag, _ = configured_rag
+def test_regulatory_natural_query_uses_the_rag(installed_rag):
+    rag, _ = installed_rag
     rag.build_index()
     body = client.post("/api/query/natural", json={"query": "What is the pit lane speed limit rule?"}).json()
     assert body["query_type"] == "regulatory"
@@ -258,6 +244,7 @@ def test_strategy_endpoint_returns_ranked_complete_plans():
     assert body["heuristic"] is True and body["tire_state"] == "supplied"
     remaining = body["remaining_laps"]
     assert remaining == 57 - 18 + 1
+    assert body["strategies"]
     for plan in body["strategies"]:
         assert sum(stint["laps"] for stint in plan["stint_breakdown"]) == remaining
         assert plan["pit_stops"] == len(plan["pit_laps"]) == len(plan["tire_compounds"]) - 1
@@ -267,12 +254,11 @@ def test_strategy_endpoint_returns_ranked_complete_plans():
 def test_strategy_endpoint_works_on_the_final_lap():
     payload = {**STRATEGY_REQUEST, "race_state": {**STRATEGY_REQUEST["race_state"], "current_lap": 57}}
     body = client.post("/api/strategy/generate", json=payload).json()
-    assert body["remaining_laps"] == 1 and all(plan["pit_stops"] == 0 for plan in body["strategies"])
+    assert body["remaining_laps"] == 1
+    assert [plan["pit_stops"] for plan in body["strategies"]] == [0]  # only the no-further-stop plan fits
 
 
 def test_strategy_endpoint_rejects_nan_literals():
-    import json
-
     raw = json.dumps(STRATEGY_REQUEST).replace('"lap_times": [95.6', '"lap_times": [NaN')
     assert "NaN" in raw
     response = client.post("/api/strategy/generate", content=raw, headers={"content-type": "application/json"})
@@ -432,8 +418,6 @@ def test_natural_query_performance_uses_only_supplied_telemetry():
 
 
 def test_natural_strategy_and_setup_routes_match_the_dedicated_endpoints():
-    import copy
-
     body = client.post("/api/query/natural", json={"query": "What pit stop strategy should I use?", "context": STRATEGY_REQUEST}).json()
     direct = client.post("/api/strategy/generate", json=STRATEGY_REQUEST).json()
     assert body["query_type"] == "strategy" and body["confidence"] is None
@@ -452,6 +436,40 @@ def test_natural_strategy_and_setup_routes_match_the_dedicated_endpoints():
     bad["tire_data"]["soft"].pop("peak_performance_window")
     assert client.post("/api/strategy/generate", json=bad).status_code == 422
     assert client.post("/api/query/natural", json={"query": "What pit stop strategy should I use?", "context": bad}).status_code == 422
+
+
+def test_an_invalid_natural_query_context_gets_the_structured_422_of_its_endpoint():
+    bad = copy.deepcopy(STRATEGY_REQUEST)
+    bad["car_status"]["engine_wear"] = 3
+    bad["race_state"]["current_lap"] = 99
+    direct = client.post("/api/strategy/generate", json=bad).json()["detail"]
+    response = client.post("/api/query/natural", json={"query": "What pit stop strategy should I use?", "context": bad})
+    assert response.status_code == 422 and "errors.pydantic.dev" not in response.text
+    detail = response.json()["detail"]
+    assert [error["loc"] for error in detail] == [["body", "context", *error["loc"][1:]] for error in direct]
+    assert [(error["msg"], error["input"]) for error in detail] == [(error["msg"], error["input"]) for error in direct]
+    assert detail[1]["input"] == "<object with 6 keys>"  # summarised like every other 422, not echoed
+
+    setup = {key: SETUP_REQUEST[key] for key in ("driver_preferences", "track_profile", "weather")}
+    setup["driver_preferences"] = {**setup["driver_preferences"], "risk_tolerance": 7}
+    response = client.post("/api/query/natural", json={"query": "What setup should I run?", "context": setup})
+    assert response.status_code == 422
+    assert [error["loc"] for error in response.json()["detail"]] == [["body", "context", "driver_preferences", "risk_tolerance"]]
+
+
+def test_a_transcription_failure_is_a_503_on_both_audio_routes(monkeypatch):
+    def failing(*args, **kwargs):
+        raise TranscriptionError("Loading the Whisper model 'tiny' failed (URLError)")
+
+    monkeypatch.setattr("app.main.classify_emotion_detailed", failing)
+    monkeypatch.setattr("app.main.process_natural_query", failing)
+    for route, payload in (
+        ("/api/emotion/classify", {"audio_file": "UklGRg==", "transcribe": True}),
+        ("/api/query/natural", {"query": "How does the driver sound on the radio?"}),
+    ):
+        response = client.post(route, json=payload)
+        assert response.status_code == 503, route
+        assert response.json() == {"detail": "Transcription failed: Loading the Whisper model 'tiny' failed (URLError)"}
 
 
 def test_natural_query_without_required_context_declines_explicitly():
@@ -515,8 +533,6 @@ def test_validation_errors_are_bounded_for_huge_invalid_objects():
 
 
 def test_only_ghost_images_are_served_under_artifacts():
-    import app.main as main
-
     (main.ARTIFACTS_DIR / "fia_rag_eval.json").parent.mkdir(parents=True, exist_ok=True)
     (main.ARTIFACTS_DIR / "fia_rag_eval.json").write_text("{}")
     assert client.get("/artifacts/fia_rag_eval.json").status_code == 404
@@ -527,23 +543,19 @@ def test_only_ghost_images_are_served_under_artifacts():
     [("", ["*"]), ("*", ["*"]), ("https://a.example, https://b.example/", ["https://a.example", "https://b.example"])],
 )
 def test_cors_origins_are_normalised(monkeypatch, value, expected):
-    import app.main as main
-
     monkeypatch.setenv("CORS_ORIGINS", value)
     assert main._cors_origins() == expected
 
 
 @pytest.mark.parametrize("value", ["*,https://a.example", "a.example", "ftp://a.example"])
 def test_invalid_cors_origins_fail_startup(monkeypatch, value):
-    import app.main as main
-
     monkeypatch.setenv("CORS_ORIGINS", value)
     with pytest.raises(RuntimeError):
         main._cors_origins()
 
 
-def test_health_reports_a_failing_provider(configured_rag):
-    rag, llm = configured_rag
+def test_health_reports_a_failing_provider(installed_rag):
+    rag, llm = installed_rag
     rag.build_index()
 
     def broken(messages):
@@ -556,8 +568,6 @@ def test_health_reports_a_failing_provider(configured_rag):
 
 
 def test_ghost_artifact_write_failure_is_a_503(monkeypatch):
-    import app.main as main
-
     def fail(*args, **kwargs):
         raise PermissionError("read-only artifacts directory")
 

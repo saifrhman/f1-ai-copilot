@@ -45,6 +45,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from dotenv import load_dotenv  # noqa: E402
 
 from core_modules.rule_checker.fia_rag import RAGUnavailableError, get_fia_rag  # noqa: E402
+from core_modules.rule_checker.fia_rag.config import validate_min_score  # noqa: E402
 from core_modules.rule_checker.fia_rag.index import close_qdrant_clients  # noqa: E402
 
 QUESTIONS_FILE = Path(__file__).with_name("fia_rag_eval_questions.json")
@@ -91,7 +92,7 @@ def evaluate(spec: Dict[str, Any], result: Dict[str, Any]) -> List[str]:
     if result["validation"]["unsupported_rules"] and result["grounded"]:
         failures.append("grounded answer references rules absent from the evidence")
 
-    if category in {"answerable", "paraphrased", "cross_document"}:
+    if category in ANSWERABLE_CATEGORIES:
         if not result["grounded"]:
             failures.append(f"expected a grounded answer, got decline ({result['decline_reason']})")
             return failures
@@ -146,7 +147,7 @@ def calibrate(specs: List[Dict[str, Any]], retrievals: Dict[str, Any]) -> Dict[s
         elif spec["category"] == "unanswerable":
             unanswerable[spec["id"]] = retrievals[spec["id"]].top_score
     rows = []
-    for step in range(0, 101):
+    for step in range(101):
         threshold = step / 100
         kept = sum(1 for need in answerable.values() if need is not None and need >= threshold)
         rejected = sum(1 for top in unanswerable.values() if top < threshold)
@@ -193,10 +194,27 @@ def print_calibration(report: Dict[str, Any], current: float) -> None:
         )
 
 
+def chat_requests(result: Dict[str, Any]) -> int:
+    """Chat-model requests behind one answer: the answer call (only with evidence) plus the claim verifier's."""
+
+    if not result["retrieval"]["passages_above_threshold"]:
+        return 0
+    return 1 + (result["validation"]["claim_verification"] is not None)
+
+
+def min_score_argument(value: str) -> float:
+    """``--threshold``: checked when the arguments are parsed, not after the retrieval phase."""
+
+    try:
+        return validate_min_score(float(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ids", nargs="*", help="only run these question ids")
-    parser.add_argument("--threshold", type=float, help="override FIA_RAG_MIN_SCORE for this run")
+    parser.add_argument("--threshold", type=min_score_argument, help="override FIA_RAG_MIN_SCORE for this run (0 to 1)")
     parser.add_argument("--retrieval-only", action="store_true", help="skip answer generation")
     parser.add_argument("--calibrate", action="store_true", help="sweep FIA_RAG_MIN_SCORE over the retrieval results (no chat calls)")
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT, help="where to write the JSON results")
@@ -247,7 +265,7 @@ def main() -> int:
             retrieval = retrievals[spec["id"]].with_threshold(threshold)
             started = time.monotonic()
             result = rag.answer_from_retrieval(retrieval)
-            chat_calls += 1 if retrieval.passages else 0
+            chat_calls += chat_requests(result)
             failures = evaluate(spec, result)
             verdict = "REVIEW" if spec["category"] == "review" else ("PASS" if not failures else "FAIL")
             failures_total += bool(failures) and verdict != "REVIEW"
@@ -266,6 +284,8 @@ def main() -> int:
                     f"  {marker}[{passage['label']}] {passage['section'] or '?'} p.{passage['page']} ({passage['page_label']}) "
                     f"rule={passage['nearest_rule']} score={passage['score']:.3f}: {preview}"
                 )
+            if result["validation"]["finish_reason"]:
+                print(f"  finish reason: {result['validation']['finish_reason']}")
             if result["validation"]["rejected_model_output"]:
                 print(f"  rejected model output: {result['validation']['rejected_model_output'][:400]!r}")
             for failure in failures:

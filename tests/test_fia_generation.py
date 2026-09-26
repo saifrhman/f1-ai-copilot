@@ -1,20 +1,16 @@
 """Grounded generation: prompt construction, citation/rule validation, refusal and provider errors."""
 
 import math
-import re
 
 import pytest
-from qdrant_client import QdrantClient
 
 from core_modules.rule_checker.fia_rag import (
     DECLINE_ANSWER,
-    ChunkingConfig,
     EmbeddingConfig,
     FIARegulationRAG,
     GenerationConfig,
     ProviderError,
     QdrantConfig,
-    RAGSettings,
     RetrievalConfig,
     RetrievedPassage,
 )
@@ -22,12 +18,13 @@ from core_modules.rule_checker.fia_rag.embeddings import EmbeddingService
 from core_modules.rule_checker.fia_rag.generation import SYSTEM_PROMPT, GroundedAnswerGenerator, build_messages
 from core_modules.rule_checker.fia_rag.grounding import (
     DeclineReason,
+    citation_spans,
     extract_citations,
     label_passages,
+    shown_citation_spans,
     validate_answer,
 )
-from tests.helpers import HashingEmbeddings, ScriptedChatModel, fia_page, write_pdf
-from tests.test_fia_index_retrieval import FUEL_FLOW, PIT_LANE, REAR_WING, UNSAFE_RELEASE
+from tests.helpers import HashingEmbeddings, ScriptedChatModel, cite_passage_containing, rag_settings, write_regulation_corpus
 
 
 def passage(text, score=0.8, source="section_b.pdf", page=10, nearest_rule=None, chunk_id="c1"):
@@ -98,6 +95,20 @@ def test_citation_parsing_handles_common_formats():
     assert extract_citations("a [S1] b [s2] c [S1, S3] d [S4; S5] e [S6][S7]") == ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]
 
 
+def test_citation_spans_are_offsets_into_the_text_as_written():
+    # "ﬁ" and full-width characters change length when normalised; the offsets still refer to the original.
+    answer = "The ﬁne is ﬁxed ［Ｓ１］, see [Source S2] (source S1-S2) as source S2 says [S1-S3]."
+    shown = [(answer[span["start"] : span["end"]], span["labels"]) for span in shown_citation_spans(answer)]
+    assert shown == [
+        ("［Ｓ１］", ["S1"]),
+        ("[Source S2]", ["S2"]),
+        ("(source S1-S2)", ["S1", "S2"]),
+        ("S2", ["S2"]),  # a prose citation shows only its label: "source S2"
+        ("[S1-S3]", ["S1", "S2", "S3"]),
+    ]
+    assert [answer[start:end] for start, end, _ in citation_spans(answer)][3] == "source S2"
+
+
 # ------------------------------------------------------------------ prompt
 
 
@@ -121,39 +132,17 @@ def test_generator_declines_without_calling_model_when_no_evidence():
 # ------------------------------------------------------------------ full pipeline with a scripted model
 
 
-def cite_passage_containing(needle, template="{claim} [{label}]."):
-    """A well-behaved model: cites the excerpt that actually contains the fact."""
-
-    def responder(messages):
-        user = messages[1].content
-        for match in re.finditer(r'<excerpt label="(S\d+)"[^>]*>\n(.*?)\n</excerpt>', user, re.S):
-            if needle in match.group(2):
-                return template.format(claim=f"The regulations state: {needle}", label=match.group(1))
-        return "INSUFFICIENT_EVIDENCE"
-
-    return responder
-
-
 @pytest.fixture
-def rag_factory(tmp_path):
-    folder = tmp_path / "fia_docs"
-    write_pdf(folder / "section_b_sporting.pdf", [fia_page(1, PIT_LANE), None, fia_page(3, UNSAFE_RELEASE)])
-    write_pdf(folder / "section_c_technical.pdf", [FUEL_FLOW, REAR_WING])
-    client = QdrantClient(":memory:")
+def rag_factory(tmp_path, qdrant):
+    folder = write_regulation_corpus(tmp_path / "fia_docs")
 
     def make(llm=None, embeddings=None, **overrides):
-        values = dict(
-            docs_path=folder,
-            chunking=ChunkingConfig(chunk_size=400, chunk_overlap=40),
-            embedding=EmbeddingConfig(model="hashing-test-512", batch_size=8),
-            retrieval=RetrievalConfig(top_k=4, min_score=0.2),
-            qdrant=QdrantConfig(collection="fia_generation_test", path=tmp_path / "unused"),
+        settings = rag_settings(
+            folder, **{"qdrant": QdrantConfig(collection="fia_generation_test", path=tmp_path / "unused"), **overrides}
         )
-        values.update(overrides)
-        return FIARegulationRAG(RAGSettings(**values), embeddings=embeddings or HashingEmbeddings(), llm=llm, qdrant_client=client)
+        return FIARegulationRAG(settings, embeddings=embeddings or HashingEmbeddings(), llm=llm, qdrant_client=qdrant)
 
-    yield make
-    client.close()
+    return make
 
 
 def test_answer_cites_real_passages_and_exposes_their_metadata(rag_factory):
@@ -165,6 +154,8 @@ def test_answer_cites_real_passages_and_exposes_their_metadata(rag_factory):
     assert result["grounded"] is True and result["status"] == "answered"
     cited = [p for p in result["retrieved_passages"] if p["cited"]]
     assert result["citations"] == [cited[0]["label"]]
+    span, = result["citation_spans"]
+    assert result["answer"][span["start"] : span["end"]] == f"[{cited[0]['label']}]" and span["labels"] == result["citations"]
     assert "80km/h" in cited[0]["text"]
     assert (cited[0]["source"], cited[0]["page"], cited[0]["page_label"]) == ("section_b_sporting.pdf", 1, "B1")
     assert math.isclose(result["confidence"], cited[0]["score"])
@@ -191,7 +182,7 @@ def test_fabricated_label_from_model_is_declined_and_raw_output_kept(rag_factory
     assert result["decline_reason"] == DeclineReason.INVALID_CITATION
     assert result["validation"]["invalid_citations"] == ["S7"]
     assert result["validation"]["rejected_model_output"].endswith("[S7].")
-    assert result["confidence"] == 0.0 and result["citations"] == []
+    assert result["confidence"] == 0.0 and result["citations"] == [] and result["citation_spans"] == []
 
 
 def test_adversarial_prompt_cannot_produce_an_invented_article(rag_factory):
@@ -279,7 +270,7 @@ def test_non_finite_query_embedding_is_rejected(rag_factory):
         rag_factory(embeddings=NaNEmbeddings()).retrieve("pit lane")
 
 
-def test_chat_model_failure_is_a_provider_error(rag_factory):
+def test_chat_model_failure_is_a_provider_error_reported_until_the_next_success(rag_factory):
     class Broken:
         def invoke(self, messages):
             raise TimeoutError("chat timed out")
@@ -288,11 +279,15 @@ def test_chat_model_failure_is_a_provider_error(rag_factory):
     rag.build_index()
     with pytest.raises(ProviderError, match="chat timed out"):
         rag.answer("What is the speed limit in the pit lane?")
-    assert "chat timed out" in rag.status()["last_error"] and rag.status()["last_error_at"]
+    status = rag.status()
+    assert "chat timed out" in status["last_error"] and status["last_error_at"]
+    assert status["provider_status"] == "failing" and status["ready"] is False
 
-    rag._llm_override = rag._llm = ScriptedChatModel(cite_passage_containing("80km/h"))
+    rag._llm = ScriptedChatModel(cite_passage_containing("80km/h"))
     assert rag.answer("What is the speed limit in the pit lane?")["grounded"]
-    assert rag.status()["last_error"] is None  # recovered: the old error is no longer reported
+    status = rag.status()  # recovered: the old error is no longer reported
+    assert status["provider_status"] == "ok" and status["ready"] is True
+    assert status["last_error"] is None and status["last_error_at"] is None
 
 
 def test_embedding_service_rejects_zero_vectors():

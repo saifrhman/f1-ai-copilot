@@ -44,7 +44,7 @@ The model is told to answer only from the excerpts and to decline otherwise, and
 * states a number the cited passages do not contain;
 * is cut off by the output limit.
 
-With `FIA_RAG_VERIFY_CLAIMS=true` a second model call also checks each sentence against the excerpts it cites. In the real evaluation, a forged-excerpt prompt injection made the chat model answer "according to Article Z1.1 … [S9]" twice; the validator rejected both (details in [docs/fia-rag.md](docs/fia-rag.md#results-with-real-documents-and-models-2026-09-2425)).
+With `FIA_RAG_VERIFY_CLAIMS=true` a second model call also checks each sentence against the excerpts it cites. In the real evaluation, a forged-excerpt prompt injection made the chat model answer "according to Article Z1.1 … [S9]" twice; the validator rejected both (details in [docs/fia-rag.md](docs/fia-rag.md#results-with-real-documents-and-models-2026-09-24-to-26)).
 
 ## Run it on your own computer
 
@@ -128,7 +128,7 @@ You can also start the two servers in two terminals: `uvicorn app.main:app` and 
   FIA_RAG_EMBEDDING_BATCH_SIZE=256
   ```
 
-  Edit the existing lines. When a name appears twice in `.env`, the later line wins, and `.env.example` sets `FIA_RAG_EMBEDDING_BATCH_SIZE=128` further down. The free tier allows **50 requests per day**, and each embedding batch counts as one request. Free model names change: if one is no longer offered, pick another on openrouter.ai.
+  Edit the existing lines. The free tier allows **50 requests per day**, and each embedding batch counts as one request. Free model names change: if one is no longer offered, pick another on openrouter.ai.
 
 The similarity threshold (`FIA_RAG_MIN_SCORE=0.30`) was calibrated for the OpenRouter embedding model. With another embedding model, check it with `python scripts/check_fia_rag.py --calibrate`. That uses one embedding request per evaluation question (15), and makes no answer calls.
 
@@ -270,18 +270,18 @@ Rebuilds switch the index over atomically: each build writes a new collection an
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Readiness of every component; `degraded` (HTTP 200) with the reason when the RAG is not ready (`not_configured`, `misconfigured`, `index_missing`/`_stale`/`_incomplete`/`_empty`, `provider_failing`) or artifacts cannot be written |
-| `GET /api/fia/status` | Configuration (paths relative to the project, URLs without credentials), documents, index state and `provider_status` |
-| `POST /api/fia/query` | `{"question": "...", "top_k": 8}` → validated answer, citations mapped to passages with source/page/section, decline reason |
+| `GET /api/fia/status` | Configuration (paths relative to the project, URLs without credentials), documents, index state and `provider_status` (from the latest regulation request, not a live provider check) |
+| `POST /api/fia/query` | `{"question": "...", "top_k": 8}` → validated answer, citations mapped to passages with source/page/section and located in the answer text, decline reason |
 | `POST /api/fia/retrieve` | `{"question": "...", "top_k": 5, "min_score": 0.3}` → ranked passages with scores, no answer model |
 | `POST /api/strategy/generate` | Telemetry lap times, car status, driver profile, tyre data, race state (optionally the fitted tyre and its age), competitors → ranked plans with stints and pit laps |
 | `POST /api/strategy/calibrate-tyres` | Lap history (compound, tyre age, lap time; out/in/safety-car laps flagged), weather, track temperature, pit-stop delta, optional fuel correction → estimated `tire_data` per compound (usable as-is in `/api/strategy/generate`), fit statistics, excluded laps, or `insufficient_data` with the reason |
 | `POST /api/setup/recommend` | Driver preferences, track profile, weather, optional `n_trials`/`seed` → setup, objective value vs. rule-of-thumb baseline, search and refinement details |
 | `POST /api/ghost/generate` | Two laps of telemetry (timestamps and speed required) → distance-aligned delta, zones, PNG under `/artifacts/ghost/` (the only files the API serves) |
-| `POST /api/emotion/classify` | Base64 or `data:audio/*` clip, at most 120 s, 2 channels, 8–96 kHz (server file paths are not accepted) → heuristic label, features, transcription status |
+| `POST /api/emotion/classify` | Base64 or `data:audio/*` clip, at most 120 s, 2 channels, 8–96 kHz (server file paths are not accepted) → heuristic label, features, transcription status, and how its confidences were computed |
 | `POST /api/query/natural` | `{"query": "...", "context": {...}}` → routed answer and routing diagnostics |
 | `POST /api/penalty/predict` | Incident type, track condition, intent, optional history → heuristic triage category and severity |
 
-Invalid input returns HTTP 422 with the reason (echoed values are truncated); an unavailable RAG returns 503; unexpected errors return a JSON 500 without internal details. Request bodies are limited while they stream in, chunked uploads included: 40 MB for the audio routes (`/api/emotion/classify`, `/api/query/natural`), 8 MB for `/api/ghost/generate`, 1 MB elsewhere (HTTP 413).
+Invalid input returns HTTP 422 with the reason (echoed values are truncated); an unavailable RAG returns 503; unexpected errors return a JSON 500 without internal details. Request bodies are limited while they stream in, chunked uploads included: 40 MiB for the audio routes (`/api/emotion/classify`, `/api/query/natural`), 8 MiB for `/api/ghost/generate`, 1 MiB elsewhere (HTTP 413).
 
 ## Verification
 
@@ -289,13 +289,13 @@ Invalid input returns HTTP 422 with the reason (echoed values are truncated); an
 python -m pytest -q
 ```
 
-The suite (1,383 tests; about 2.5 minutes; CI runs it on Python 3.11 and 3.12) runs without network access or credentials:
+The suite (1,442 tests; about 2.5 minutes; CI runs it on Python 3.11 and 3.12) runs without network access or credentials:
 
-* **FIA RAG** (`test_fia_*.py`, 214 tests) – real PDF files generated in the tests, real pypdf parsing, the real LangChain splitter and a real embedded Qdrant; only the embedding and chat services are replaced by a deterministic bag-of-words embedder and a scripted model. Covered: document validation (HTML-as-PDF, corrupt, truncated, empty, unreadable, duplicate, manifest hash and consistency), headers and contents pages, chunk size/overlap and metadata, deterministic chunk IDs, idempotent and stale-aware indexing (each fingerprint input separately), persistence across restarts, top-k and threshold behaviour, fabricated citations in every style, invented or misattributed rule numbers in every common form, uncited statements, numbers absent from the cited evidence, definition extraction/selection/storage, the claim verifier, truncated output, declines, prompt-injection attempts, provider failures, cache corruption, atomic index rebuilds under a concurrent reader, the real OpenAI clients on the wire against a local stub server, and that generation settings and `top_k` never touch the index.
+* **FIA RAG** (`test_fia_*.py`, 239 tests) – real PDF files generated in the tests, real pypdf parsing, the real LangChain splitter and a real embedded Qdrant; only the embedding and chat services are replaced by a deterministic bag-of-words embedder and a scripted model. Covered: document validation (HTML-as-PDF, corrupt, truncated, empty, unreadable, duplicate, manifest hash and consistency), headers and contents pages, chunk size/overlap and metadata, deterministic chunk IDs, idempotent and stale-aware indexing (each fingerprint input separately), persistence across restarts, top-k and threshold behaviour, fabricated citations in every style, invented or misattributed rule numbers in every common form, uncited statements, numbers absent from the cited evidence, definition extraction/selection/storage, the claim verifier, truncated output, declines, prompt-injection attempts, provider failures, cache corruption, atomic index rebuilds under a concurrent reader, the real OpenAI clients on the wire against a local stub server, and that generation settings and `top_k` never touch the index.
 * **Downloader and evaluation harness** (`test_fetch_fia_regulations.py`, `test_check_fia_rag.py`) – latest-issue selection, safe replacement of superseded files, partial `--sections` runs, PDF validation, and checks that the end-to-end evaluation fails when answers are wrong.
-* **API** (`test_api_endpoints.py`, 69 tests) – every endpoint's contract (including tyre calibration and its round trip into strategy generation), status codes (413/422/503/500), streaming body limits, NaN literals, lone surrogates and deep nesting, CORS, artifact serving, health states, and RAG endpoints backed by a real in-memory index.
+* **API** (`test_api_endpoints.py`, 74 tests) – every endpoint's contract (including tyre calibration and its round trip into strategy generation), status codes (413/422/503/500), streaming body limits, NaN literals, lone surrogates and deep nesting, CORS, artifact serving, health states, and RAG endpoints backed by a real in-memory index.
 * **Modules** – strategy (lap-accounting invariants on random states, dynamic-programming optimum checked against brute force, last laps, current tyre), setup (search beats the baseline, reproducibility, assumed defaults, validation), ghost (known time deltas recovered across sampling rates), emotion (pitch accuracy on synthetic speech; rejection of silence, noise, non-audio, oversized or high-rate audio and server paths), router (routing, lap references, regulatory declines), triage, tyre calibration (known parameters recovered, contaminated and mixed-pace histories rejected) and Whisper settings.
-* **Web UI** (`test_ui_*.py`, 170 tests) – every page run with Streamlit's AppTest against the real API (FastAPI TestClient; the RAG pages against a real in-memory index): rendered values, citations and declines, 422/503/connection errors, client-side input checks, the HTTP client and the `run_app.py` launcher. The pages were also checked in Chrome at phone and desktop widths against the real index (not part of pytest).
+* **Web UI** (`test_ui_*.py`, 181 tests) – every page run with Streamlit's AppTest against the real API (FastAPI TestClient; the RAG pages against a real in-memory index): rendered values, citations and declines, 422/503/connection errors, client-side input checks, the HTTP client and the `run_app.py` launcher. The pages were also checked in Chrome at phone and desktop widths against the real index (not part of pytest).
 
 Deliberately breaking any of the grounding, fingerprint, manifest, cache, request-limit or evaluation checks makes at least one test fail (14 of 14 such mutations were caught; for the definition, number, uncited-statement and claim-verifier checks 19 of 20, the survivor being an equivalent mutation; for the UI, every one of its fixes when reverted).
 
@@ -305,7 +305,7 @@ End-to-end runs with real documents and models (not part of `pytest`, they need 
 python scripts/check_fia_rag.py     # results for the 2026 regulations are in docs/fia-rag.md
 ```
 
-With OpenRouter's free models the latest run passed all 14 checked questions (answerable, paraphrased, cross-document, unanswerable and adversarial) and correctly declined the DRS trap question. The unsafe-release question, which earlier runs declined because "TTCS" was undefined in the retrieved text, is now answered from the added TTCS definition. `python scripts/check_fia_rag.py --calibrate` sweeps the similarity threshold without chat calls. Results, including the claim-verifier test, are in [docs/fia-rag.md](docs/fia-rag.md#results-with-real-documents-and-models-2026-09-2425).
+With OpenRouter's free models the last two runs answered all 14 checked questions (answerable, paraphrased, cross-document, unanswerable and adversarial) correctly and declined the DRS trap question. In the latest run the validator first rejected one correct answer because it did not recognise a parenthesised "(Inference: ...)" marker; that is fixed and pinned by a test. The unsafe-release question, which earlier runs declined because "TTCS" was undefined in the retrieved text, is now answered from the added TTCS definition. `python scripts/check_fia_rag.py --calibrate` sweeps the similarity threshold without chat calls. Results, including the claim-verifier test, are in [docs/fia-rag.md](docs/fia-rag.md#results-with-real-documents-and-models-2026-09-24-to-26).
 
 ## Configuration
 
@@ -346,8 +346,9 @@ app/main.py                          FastAPI application
 ui/streamlit_app.py                  Streamlit web UI entry point (pages in ui/views/, HTTP client in
                                      ui/api_client.py, settings in ui/.streamlit/config.toml)
 core_modules/
-  rule_checker/fia_rag/              FIA regulation RAG (config, ingestion, embeddings, index,
-                                     retrieval, generation, grounding, rules, pipeline)
+  rule_checker/fia_rag/              FIA regulation RAG (config, errors, ingestion, embeddings, index,
+                                     glossary, retrieval, generation, grounding, rules, pipeline)
+  rule_checker/fia_files.py          official FIA file names (shared by the downloader and the RAG)
   rule_checker/penalty_predictor.py  incident triage (+ schemas.py)
   strategy_optimizer/                strategy engine, tyre calibration (+ schemas.py, example, README)
   setup_optimizer/                   setup recommender (+ schemas.py)

@@ -71,6 +71,7 @@ class RequestNotSent(ApiError):
 
     def __init__(self, reason: str) -> None:
         super().__init__(0, f"the request could not be encoded as JSON: {reason}")
+        self.reason = reason
 
 
 def encode_json(payload: Any) -> bytes:
@@ -158,7 +159,8 @@ def resolve_base_url() -> str:
 
 
 def format_validation_error(error: Any) -> str:
-    """One FastAPI validation error as ``field.path[0]: message (got value)``."""
+    """One FastAPI validation error as ``field.path[0]: message (got value)``, without pydantic's
+    "Value error, " prefix of a validator's own message."""
 
     if not isinstance(error, dict):
         return str(error)
@@ -168,7 +170,7 @@ def format_validation_error(error: Any) -> str:
     location = ""
     for part in loc:
         location += f"[{part}]" if isinstance(part, int) else (f".{part}" if location else str(part))
-    text = f"{location or 'request body'}: {error.get('msg', 'invalid value')}"
+    text = f"{location or 'request body'}: {str(error.get('msg', 'invalid value')).removeprefix('Value error, ')}"
     value = error.get("input")
     summarised = isinstance(value, str) and value.startswith(("<object with", "<array with"))
     if error.get("type") != "missing" and value is not None and not summarised:
@@ -268,9 +270,6 @@ class ApiClient:
         return self._json("POST", path, payload=dict(payload), read_timeout=read_timeout)
 
     # ------------------------------------------------------------------ service
-
-    def root(self) -> Dict[str, Any]:
-        return self._json("GET", "/")
 
     def health(self) -> Dict[str, Any]:
         """Readiness of every module (``status`` is ``healthy`` or ``degraded``)."""

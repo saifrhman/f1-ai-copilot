@@ -34,7 +34,7 @@ from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
-from pydantic import BaseModel, ConfigDict, Field, StrictInt  # noqa: E402
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError  # noqa: E402
 
 from core_modules.driver_emotion.emotion_classifier import (  # noqa: E402
     TranscriptionError,
@@ -46,7 +46,7 @@ from core_modules.ghost_car.ghost_car_visualizer import generate_ghost_compariso
 from core_modules.ghost_car.schemas import GhostCarRequest  # noqa: E402
 from core_modules.llm_query.natural_query import MAX_QUERY_CHARS, process_natural_query  # noqa: E402
 from core_modules.rule_checker.fia_rag import RAGUnavailableError, get_fia_rag  # noqa: E402
-from core_modules.rule_checker.fia_rag.config import RetrievalConfig  # noqa: E402
+from core_modules.rule_checker.fia_rag.config import RetrievalConfig, resolve_project_path  # noqa: E402
 from core_modules.rule_checker.fia_rag.index import close_qdrant_clients  # noqa: E402
 from core_modules.rule_checker.fia_rag.retrieval import MAX_QUESTION_CHARS  # noqa: E402
 from core_modules.rule_checker.penalty_predictor import predict_penalty  # noqa: E402
@@ -57,9 +57,8 @@ from core_modules.strategy_optimizer.schemas import (  # noqa: E402
     StrategyRequest,
     TyreCalibrationRequest,
     calibrate_tyres_response,
-    strategy_result_to_dict,
+    generate_strategy_response,
 )
-from core_modules.strategy_optimizer.strategy_engine import generate_strategy  # noqa: E402
 
 logger = logging.getLogger("f1_copilot.api")
 
@@ -73,14 +72,7 @@ ROUTE_BODY_LIMITS = {
     "/api/ghost/generate": 8 * 1024 * 1024,
 }
 DEFAULT_BODY_LIMIT = 1024 * 1024
-
-
-def _project_path(value: str) -> Path:
-    path = Path(value).expanduser()
-    return path if path.is_absolute() else PROJECT_ROOT / path
-
-
-ARTIFACTS_DIR = _project_path(os.getenv("F1_ARTIFACTS_DIR", "outputs"))
+ARTIFACTS_DIR = resolve_project_path(os.getenv("F1_ARTIFACTS_DIR", "outputs"))
 GHOST_ARTIFACTS_DIR = ARTIFACTS_DIR / "ghost"
 
 
@@ -170,7 +162,6 @@ class BodyLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
-
 # Middleware added last runs first: CORS stays outermost so 413/500 responses carry CORS headers.
 app.add_middleware(BodyLimitMiddleware)
 CORS_ORIGINS = _cors_origins()
@@ -242,6 +233,12 @@ async def rag_unavailable_handler(_: Request, exc: RAGUnavailableError) -> JSONR
     )
 
 
+@app.exception_handler(TranscriptionError)
+async def transcription_error_handler(_: Request, exc: TranscriptionError) -> JSONResponse:
+    # Whisper was requested and available but failed (model download, ffmpeg): the audio itself was valid.
+    return JSONResponse(status_code=503, content={"detail": f"Transcription failed: {_public_message(exc)}"})
+
+
 @app.exception_handler(Exception)
 async def unexpected_error_handler(_: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled error", exc_info=exc)
@@ -292,6 +289,12 @@ class RetrievedPassageOut(BaseModel):
     defined_term: Optional[str] = Field(description="The defined term, for definition passages")
 
 
+class CitationSpanOut(BaseModel):
+    start: int = Field(description="Offset in `answer` (Unicode code points) where the citation is shown")
+    end: int = Field(description="Offset in `answer` just after it")
+    labels: List[str] = Field(description="Labels it names, ranges expanded, e.g. [S1-S3] -> S1, S2, S3")
+
+
 class FIAAnswerResponse(BaseModel):
     question: str
     answer: str = Field(description="Validated answer with [S#] labels, or the standard decline message")
@@ -308,13 +311,32 @@ class FIAAnswerResponse(BaseModel):
         description="Best similarity among cited regulation passages (evidence-strength proxy, not a probability)"
     )
     citations: List[str] = Field(description="Labels cited by the answer; each maps to a retrieved_passages entry")
+    citation_spans: List[CitationSpanOut] = Field(
+        description=(
+            "Each citation as written in `answer`, in text order: the whole token ([S1], (source S2)), or only the "
+            "label of a prose citation (the S2 of 'source S2'). Empty for a decline"
+        )
+    )
     referenced_rules: List[str] = Field(description="Rule identifiers in the answer, all verified against the evidence")
     retrieved_passages: List[RetrievedPassageOut] = Field(
         description="Evidence given to the model: passages above the threshold, then definitions of terms they use"
     )
     top_retrieval_score: float
-    retrieval: Dict[str, Any] = Field(description="top_k, min_score, passages below the threshold, duplicates removed")
-    validation: Dict[str, Any] = Field(description="invalid citations, unsupported rules, rejected model output")
+    retrieval: Dict[str, Any] = Field(
+        description=(
+            "top_k, min_score, passages_above_threshold, definitions_added, below_threshold (the passages under "
+            "min_score) and duplicates_removed"
+        )
+    )
+    validation: Dict[str, Any] = Field(
+        description=(
+            "invalid_citations, unsupported_rules, uncited_claims, unsupported_numbers, unverified_claims, "
+            "claim_verification (null when FIA_RAG_VERIFY_CLAIMS is off or the answer was declined before "
+            "verification), rejected_model_output (the model text, only when it failed validation) and "
+            "finish_reason (what stopped a truncated_model_output reply: length, max_tokens or content_filter; "
+            "null otherwise)"
+        )
+    )
     models: Dict[str, Optional[str]]
     source: str
 
@@ -436,7 +458,7 @@ def retrieve_fia_passages(request: FIARetrieveRequest) -> Dict[str, Any]:
 @app.post("/api/strategy/generate")
 def generate_race_strategy(request: StrategyRequest) -> Dict[str, Any]:
     try:
-        return strategy_result_to_dict(generate_strategy(**request.to_engine_inputs()))
+        return generate_strategy_response(request)
     except ValueError as exc:
         raise _unprocessable(exc) from exc
 
@@ -479,18 +501,20 @@ def classify_driver_emotion(request: EmotionRequest) -> Dict[str, Any]:
         return classify_emotion_detailed(request.audio_file, transcribe=request.transcribe, allow_local_paths=False)
     except ValueError as exc:
         raise _unprocessable(exc) from exc
-    except TranscriptionError as exc:
-        raise HTTPException(status_code=503, detail=f"Transcription failed: {_public_message(exc)}") from exc
 
 
 @app.post("/api/query/natural")
 def process_query(request: NaturalQueryRequest) -> Dict[str, Any]:
     try:
         return process_natural_query(request.query, request.context)
+    except ValidationError as exc:
+        # The strategy and setup handlers validate the context with their endpoints' request models:
+        # report those errors like every other 422 (a capped list, located under body.context).
+        raise RequestValidationError(
+            [{**error, "loc": ("body", "context", *error["loc"])} for error in exc.errors()]
+        ) from exc
     except ValueError as exc:
         raise _unprocessable(exc) from exc
-    except TranscriptionError as exc:
-        raise HTTPException(status_code=503, detail=f"Transcription failed: {_public_message(exc)}") from exc
 
 
 @app.post("/api/penalty/predict")

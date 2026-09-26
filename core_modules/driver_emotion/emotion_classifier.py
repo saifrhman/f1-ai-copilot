@@ -33,7 +33,7 @@ import stat
 import tempfile
 import threading
 import urllib.error
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -78,6 +78,14 @@ MIN_VOICED_SHARE = 0.2  # share of non-silent frames that must be voiced
 NEUTRAL_CONFIDENCE_THRESHOLD = 0.20
 MAX_CONFIDENCE = 0.95
 SCORE_DECIMALS = 3  # confidences and profile scores are heuristic margins; more digits are noise
+# Acoustic confidence = weight x the best profile similarity + weight x its lead over the runner-up.
+ACOUSTIC_SIMILARITY_WEIGHT = 0.45
+ACOUSTIC_LEAD_WEIGHT = 0.55
+ACOUSTIC_CONFIDENCE_RULE = (
+    f"{ACOUSTIC_SIMILARITY_WEIGHT} × the best profile similarity + {ACOUSTIC_LEAD_WEIGHT} × its lead over the "
+    f"runner-up, at most {MAX_CONFIDENCE}; below {NEUTRAL_CONFIDENCE_THRESHOLD:.2f}, or when two profiles tie for "
+    "the best similarity, the acoustic label is neutral"
+)
 
 _INVALID_INPUT_MESSAGE = (
     "audio_file must be base64-encoded audio or a data:audio/<type>;base64,<data> URI "
@@ -92,8 +100,8 @@ _DECODE_ERROR_MESSAGE = (
 _TOO_LONG_MESSAGE = f"Audio is longer than the {MAX_DURATION_S:.0f} s limit; send a shorter radio clip"
 DISCLAIMER = (
     "Heuristic analysis: acoustic pitch/energy profiles and transcript keyword matching. "
-    "Not a validated emotion model; the acoustic confidence is a heuristic score (0.45 x the best profile "
-    "similarity + 0.55 x its lead over the runner-up), not a probability."
+    "Not a validated emotion model; each confidence is a heuristic score, not a probability "
+    "(acoustic_confidence_rule and evidence_combination_rule say how it is computed)."
 )
 
 
@@ -109,15 +117,6 @@ class EmotionType(Enum):
 
 class TranscriptionError(RuntimeError):
     """Whisper was available but failed while loading the model or transcribing."""
-
-
-@dataclass
-class EmotionResult:
-    emotion: EmotionType
-    confidence: float
-    timestamp: Optional[str] = None
-    duration: Optional[float] = None
-    audio_features: Optional[Dict[str, float]] = None
 
 
 @dataclass(frozen=True)
@@ -204,10 +203,8 @@ def audio_input_file(audio_input: str, allow_local_paths: bool = False) -> Itera
             handle.write(data)
         yield temp_path
     finally:
-        try:
+        with suppress(FileNotFoundError):
             os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
 
 
 def _check_sample_rate(sample_rate: int) -> None:
@@ -382,15 +379,6 @@ def voiced_pitch(y: np.ndarray, sr: int, frame_rms: np.ndarray) -> Tuple[np.ndar
 class AudioFeatureExtractor:
     """Extract the acoustic features used by the transparent heuristic classifier."""
 
-    def __init__(self, sample_rate: int = ANALYSIS_SAMPLE_RATE):
-        self.sample_rate = sample_rate
-
-    def extract_features(self, audio_file: str) -> Dict[str, float]:
-        """Load an audio file path (already validated/trusted) and extract features."""
-
-        samples, _ = load_waveform(audio_file, self.sample_rate)
-        return self.features_from_waveform(samples, self.sample_rate)
-
     @staticmethod
     def features_from_waveform(samples: np.ndarray, sr: int) -> Dict[str, float]:
         """Features of a mono waveform; raises ValueError for short, silent or unvoiced audio.
@@ -491,6 +479,23 @@ _KEYWORD_PATTERNS: List[Tuple[Tuple[str, ...], EmotionType]] = sorted(
 _CLAUSE_SPLIT = re.compile(r"[.,;:!?\n]+")
 _TOKEN = re.compile(r"[a-z0-9']+")
 TEXT_OVERRIDE_MIN_NET_HITS = 2
+TEXT_AGREEMENT_BONUS = 0.10
+# What each rule of combine_evidence does (the response's evidence_combination_rule).
+EVIDENCE_COMBINATION_RULES = {
+    "acoustic_only": "The acoustic label is used: there was no transcript, or its keywords were neutral or tied.",
+    "text_agrees": (
+        f"Transcript keywords agree with the acoustic label; confidence = min({MAX_CONFIDENCE}, max(acoustic, text) "
+        f"+ {TEXT_AGREEMENT_BONUS:.2f})."
+    ),
+    "text_overrides_acoustic": (
+        f"Transcript keywords (at least {TEXT_OVERRIDE_MIN_NET_HITS} more hits for one emotion than for any other, "
+        "and a higher score) override the acoustic label; confidence = text - acoustic / 2."
+    ),
+    "acoustic_kept_text_disagrees": (
+        "The transcript points to another emotion but too weakly (e.g. a single keyword), so the acoustic label is "
+        "kept; confidence = max(0, acoustic - text / 2)."
+    ),
+}
 
 
 def _clause_tokens(text: str) -> Iterator[List[str]]:
@@ -544,13 +549,7 @@ def combine_evidence(
 ) -> Tuple[EmotionType, float, str]:
     """Combine acoustic and transcript evidence (heuristic). Returns (emotion, confidence, rule).
 
-    The acoustic label is the default. Rules:
-    - no transcript, or NEUTRAL/ambiguous text: acoustic label and confidence ("acoustic_only").
-    - text agrees: acoustic label, confidence min(0.95, max(a, t) + 0.10) ("text_agrees").
-    - text disagrees with at least ``TEXT_OVERRIDE_MIN_NET_HITS`` net keyword hits and t > a:
-      text label, confidence t - a/2 ("text_overrides_acoustic").
-    - otherwise the text disagrees but is too weak (e.g. a single keyword): acoustic label kept,
-      confidence a - t/2 ("acoustic_kept_text_disagrees").
+    The acoustic label is the default; ``EVIDENCE_COMBINATION_RULES`` says what each rule does.
     The confidence is rounded to ``SCORE_DECIMALS``.
     """
 
@@ -559,7 +558,7 @@ def combine_evidence(
         return acoustic_emotion, round(a, SCORE_DECIMALS), "acoustic_only"
     t = float(text.confidence)
     if text.emotion is acoustic_emotion:
-        return acoustic_emotion, round(min(MAX_CONFIDENCE, max(a, t) + 0.10), SCORE_DECIMALS), "text_agrees"
+        return acoustic_emotion, round(min(MAX_CONFIDENCE, max(a, t) + TEXT_AGREEMENT_BONUS), SCORE_DECIMALS), "text_agrees"
     if text.net_hits >= TEXT_OVERRIDE_MIN_NET_HITS and t > a:
         return text.emotion, round(max(0.0, t - a / 2.0), SCORE_DECIMALS), "text_overrides_acoustic"
     return acoustic_emotion, round(max(0.0, a - t / 2.0), SCORE_DECIMALS), "acoustic_kept_text_disagrees"
@@ -577,7 +576,6 @@ class EmotionClassifier:
     REQUIRED_FEATURES = ("mean_pitch", "pitch_std", "rms_energy", "energy_std")
 
     def __init__(self):
-        self.feature_extractor = AudioFeatureExtractor()
         self.emotion_thresholds = self._load_emotion_thresholds()
 
     @staticmethod
@@ -592,12 +590,6 @@ class EmotionClassifier:
             EmotionType.EXCITED: {"mean_pitch": (180, 400), "pitch_std": (25, 90), "rms_energy": (0.20, 0.85), "energy_std": (0.07, 0.35)},
             EmotionType.FRUSTRATED: {"mean_pitch": (150, 340), "pitch_std": (25, 85), "rms_energy": (0.15, 0.75), "energy_std": (0.08, 0.40)},
         }
-
-    def classify_emotion(self, audio_file: str, allow_local_paths: bool = False) -> EmotionResult:
-        with audio_input_file(audio_file, allow_local_paths) as path:
-            features = self.feature_extractor.extract_features(path)
-        emotion, confidence = self._classify_from_features(features)
-        return EmotionResult(emotion=emotion, confidence=confidence, duration=features["duration"], audio_features=features)
 
     def profile_scores(self, features: Dict[str, float]) -> Dict[EmotionType, float]:
         """Mean band similarity per profile (rounded to ``SCORE_DECIMALS``).
@@ -623,12 +615,9 @@ class EmotionClassifier:
             scores[emotion] = round(float(np.mean(parts)), SCORE_DECIMALS)
         return scores
 
-    def _classify_from_features(self, features: Dict[str, float]) -> Tuple[EmotionType, float]:
-        return self.label_from_scores(self.profile_scores(features))
-
     @staticmethod
     def label_from_scores(scores: Dict[EmotionType, float]) -> Tuple[EmotionType, float]:
-        """Best profile with confidence 0.45*best + 0.55*(best - runner_up); NEUTRAL below 0.20.
+        """Best profile and its confidence (``ACOUSTIC_CONFIDENCE_RULE``).
 
         The confidence is rounded to ``SCORE_DECIMALS`` before the NEUTRAL threshold is applied, so
         the reported value is the one the threshold saw. An exact tie for the best score is ambiguous
@@ -640,15 +629,11 @@ class EmotionClassifier:
         second_score = ordered[1][1] if len(ordered) > 1 else 0.0
         if len(ordered) > 1 and best_score == second_score:
             return EmotionType.NEUTRAL, 0.0
-        raw = 0.45 * best_score + 0.55 * max(0.0, best_score - second_score)
+        raw = ACOUSTIC_SIMILARITY_WEIGHT * best_score + ACOUSTIC_LEAD_WEIGHT * max(0.0, best_score - second_score)
         confidence = round(float(np.clip(raw, 0.0, MAX_CONFIDENCE)), SCORE_DECIMALS)
         if confidence < NEUTRAL_CONFIDENCE_THRESHOLD:
             return EmotionType.NEUTRAL, confidence
         return best_emotion, confidence
-
-    @staticmethod
-    def classify_emotion_from_text(text: str) -> TextEmotionEvidence:
-        return classify_text_emotion(text)
 
 
 # ---------------------------------------------------------------------------
@@ -879,10 +864,6 @@ class WhisperTranscriber:
             return False, "ffmpeg was not found on PATH (Whisper needs it to read audio)"
         return True, None
 
-    @property
-    def available(self) -> bool:
-        return self.availability()[0]
-
     def _require_available(self) -> None:
         available, reason = self.availability()
         if not available:
@@ -951,10 +932,6 @@ def get_transcriber() -> WhisperTranscriber:
         return _transcriber
 
 
-def classify_emotion(audio_file: str, allow_local_paths: bool = False) -> str:
-    return get_emotion_classifier().classify_emotion(audio_file, allow_local_paths).emotion.value
-
-
 def classify_emotion_detailed(audio_file: str, transcribe: bool = False, allow_local_paths: bool = False) -> Dict[str, Any]:
     """Classify driver-radio emotion (heuristic) and return a JSON-serialisable result.
 
@@ -978,7 +955,7 @@ def classify_emotion_detailed(audio_file: str, transcribe: bool = False, allow_l
     status, unavailable_reason = "not_requested", None
     with audio_input_file(audio_file, allow_local_paths) as path:
         samples, source_sr = load_waveform(path)
-        features = classifier.feature_extractor.features_from_waveform(samples, ANALYSIS_SAMPLE_RATE)
+        features = AudioFeatureExtractor.features_from_waveform(samples, ANALYSIS_SAMPLE_RATE)
         profile_scores = classifier.profile_scores(features)
         acoustic_emotion, acoustic_confidence = classifier.label_from_scores(profile_scores)
         if transcribe:
@@ -997,6 +974,7 @@ def classify_emotion_detailed(audio_file: str, transcribe: bool = False, allow_l
         "confidence": float(confidence),
         "acoustic_emotion": acoustic_emotion.value,
         "acoustic_confidence": float(acoustic_confidence),
+        "acoustic_confidence_rule": ACOUSTIC_CONFIDENCE_RULE,
         "acoustic_profile_scores": {key.value: value for key, value in profile_scores.items()},
         "audio_features": features,
         "duration": features["duration"],
@@ -1009,6 +987,7 @@ def classify_emotion_detailed(audio_file: str, transcribe: bool = False, allow_l
         "text_keyword_hits": text.keyword_hits if text else None,
         "negated_keywords": text.negated_keywords if text else None,
         "evidence_combination": rule,
+        "evidence_combination_rule": EVIDENCE_COMBINATION_RULES[rule],
         "classifier": "acoustic heuristic" + (" + Whisper transcript keyword heuristic" if text else ""),
         "disclaimer": DISCLAIMER,
     }

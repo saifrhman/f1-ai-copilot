@@ -19,8 +19,9 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from .config import GenerationConfig, ProviderConfig
 from .errors import ProviderError, RAGConfigurationError, describe_provider_error
 from .grounding import (
-    INSUFFICIENT_EVIDENCE,
     DECLINE_ANSWER,
+    INSUFFICIENT_EVIDENCE,
+    SENTENCE_BREAK,
     DeclineReason,
     Outcome,
     ValidatedAnswer,
@@ -105,9 +106,8 @@ def build_messages(question: str, labelled: Dict[str, RetrievedPassage]) -> List
 def answer_sentences(answer: str) -> List[str]:
     """The answer split into sentences / list items, each keeping its citation labels."""
 
-    parts = re.split(r"(?<=[.!?])\s+(?=\S)|\n+", answer)
     sentences = []
-    for part in parts:
+    for part in SENTENCE_BREAK.split(answer):
         part = part.strip()
         if not part:
             continue
@@ -188,7 +188,7 @@ class GroundedAnswerGenerator:
         finish_reason = _finish_reason(response)
         if finish_reason in _INCOMPLETE_FINISH_REASONS:
             # A cut-off answer can end mid-clause ("... does not apply if the"), so it is never accepted.
-            return GenerationResult(labelled, declined(DeclineReason.TRUNCATED, f"[finish_reason={finish_reason}] {text}"))
+            return GenerationResult(labelled, declined(DeclineReason.TRUNCATED, text, finish_reason=finish_reason))
         validation = validate_answer(text, labelled)
         verification = None
         if validation.grounded and self.config.verify_claims:

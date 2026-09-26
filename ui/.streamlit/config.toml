@@ -11,9 +11,8 @@ gatherUsageStats = false
 address = "127.0.0.1"
 port = 8501
 # Largest upload in MiB. Radio clips may be at most 20 MiB decoded (the API's audio limit), which
-# is about 27 MiB as base64 JSON, inside the API's 40 MB body limit for audio routes.
+# is about 27 MiB as base64 JSON, inside the API's 40 MiB body limit for audio routes.
 maxUploadSize = 20
-runOnSave = false
 
 [client]
 # Hide developer options (e.g. "Clear cache") from the app menu.

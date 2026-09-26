@@ -29,7 +29,6 @@ Everything here is a documented heuristic:
 """
 
 import re
-import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, FrozenSet, List, Optional, Type, TypeVar
@@ -240,120 +239,90 @@ def _severity_band(severity: float) -> str:
     return "low"
 
 
-class PenaltyPredictor:
-    """Deterministic triage estimator, not a trained steward-decision model. Stateless and thread-safe."""
-
-    VALID_CONDITIONS = frozenset(member.value for member in TrackCondition)
-    VALID_INTENTS = frozenset(member.value for member in Intent)
-
-    def predict_penalty(
-        self,
-        incident_type: str,
-        track_condition: str,
-        intent: str,
-        driver_history: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        incident = parse_choice(incident_type, IncidentType, "incident_type")
-        condition = parse_choice(track_condition, TrackCondition, "track_condition")
-        intent_value = parse_choice(intent, Intent, "intent")
-        history = validate_driver_history(driver_history)
-
-        profile = PROFILES[incident]
-        severity = profile.base_severity
-        reasoning = [profile.rationale]
-        adjustments: List[Dict[str, Any]] = []
-
-        def adjust(source: str, value: Any, delta: float, reason: str) -> None:
-            nonlocal severity
-            severity += delta
-            adjustments.append({"source": source, "value": value, "delta": delta})
-            reasoning.append(reason)
-
-        if intent_value is Intent.INTENTIONAL and incident in DRIVING_CONDUCT:
-            adjust("intent", intent_value.value, INTENTIONAL_DELTA, "Intentional conduct raises the triage severity.")
-        elif intent_value is Intent.RACING_INCIDENT and incident in CAR_TO_CAR:
-            adjust(
-                "intent",
-                intent_value.value,
-                RACING_INCIDENT_DELTA,
-                "A racing-incident description lowers the preliminary severity, subject to evidence.",
-            )
-        elif intent_value in (Intent.INTENTIONAL, Intent.RACING_INCIDENT):
-            reasoning.append(f"The '{intent_value.value}' intent does not change the triage of a {incident.value} case.")
-
-        if condition in REDUCED_GRIP and incident in DRIVING_CONDUCT:
-            reasoning.append("Reduced-grip conditions are recorded as context but do not automatically excuse an infringement.")
-
-        if history:
-            recent = history.get("recent_penalties")
-            total = history.get("total_penalties")
-            if recent is not None and len(recent) >= RECENT_PENALTIES_THRESHOLD:
-                adjust(
-                    "driver_history.recent_penalties",
-                    len(recent),
-                    RECENT_PENALTIES_DELTA,
-                    "The supplied recent-history count increases the triage severity.",
-                )
-            if total is not None and total >= TOTAL_PENALTIES_THRESHOLD:
-                adjust(
-                    "driver_history.total_penalties",
-                    total,
-                    TOTAL_PENALTIES_DELTA,
-                    "The supplied long-term history increases the triage severity slightly.",
-                )
-
-        # The band is derived from the same rounded score that is reported.
-        severity = round(max(0.0, min(1.0, severity)), 3)
-
-        # Completeness of the inputs that can change this incident type's severity
-        # (track condition never does, so it is not counted).
-        supplied = {"driver_history": history is not None}
-        if incident in DRIVING_CONDUCT:
-            supplied["intent"] = intent_value is not Intent.UNKNOWN
-        confidence = 0.50 + 0.20 * sum(supplied.values()) / len(supplied)
-
-        return {
-            "triage_category": profile.outcome_category,
-            "severity_band": _severity_band(severity),
-            "severity_score": severity,
-            "severity_adjustments": adjustments,
-            "confidence": round(confidence, 3),
-            "confidence_basis": CONFIDENCE_BASIS,
-            "confidence_inputs": supplied,
-            "referenced_rule": None,
-            "reasoning": " ".join(reasoning),
-            "inputs": {
-                "incident_type": incident.value,
-                "track_condition": condition.value,
-                "intent": intent_value.value,
-                "driver_history": history,
-            },
-            "method": METHOD,
-            "disclaimer": DISCLAIMER,
-        }
-
-
-_penalty_predictor: Optional[PenaltyPredictor] = None
-_penalty_predictor_lock = threading.Lock()
-
-
-def get_penalty_predictor() -> PenaltyPredictor:
-    global _penalty_predictor
-    with _penalty_predictor_lock:
-        if _penalty_predictor is None:
-            _penalty_predictor = PenaltyPredictor()
-        return _penalty_predictor
-
-
 def predict_penalty(
     incident_type: str,
     track_condition: str,
     intent: str,
     driver_history: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return get_penalty_predictor().predict_penalty(
-        incident_type=incident_type,
-        track_condition=track_condition,
-        intent=intent,
-        driver_history=driver_history,
-    )
+    """Deterministic triage estimator, not a trained steward-decision model."""
+
+    incident = parse_choice(incident_type, IncidentType, "incident_type")
+    condition = parse_choice(track_condition, TrackCondition, "track_condition")
+    intent_value = parse_choice(intent, Intent, "intent")
+    history = validate_driver_history(driver_history)
+
+    profile = PROFILES[incident]
+    severity = profile.base_severity
+    reasoning = [profile.rationale]
+    adjustments: List[Dict[str, Any]] = []
+
+    def adjust(source: str, value: Any, delta: float, reason: str) -> None:
+        nonlocal severity
+        severity += delta
+        adjustments.append({"source": source, "value": value, "delta": delta})
+        reasoning.append(reason)
+
+    if intent_value is Intent.INTENTIONAL and incident in DRIVING_CONDUCT:
+        adjust("intent", intent_value.value, INTENTIONAL_DELTA, "Intentional conduct raises the triage severity.")
+    elif intent_value is Intent.RACING_INCIDENT and incident in CAR_TO_CAR:
+        adjust(
+            "intent",
+            intent_value.value,
+            RACING_INCIDENT_DELTA,
+            "A racing-incident description lowers the preliminary severity, subject to evidence.",
+        )
+    elif intent_value in (Intent.INTENTIONAL, Intent.RACING_INCIDENT):
+        reasoning.append(f"The '{intent_value.value}' intent does not change the triage of a {incident.value} case.")
+
+    if condition in REDUCED_GRIP and incident in DRIVING_CONDUCT:
+        reasoning.append("Reduced-grip conditions are recorded as context but do not automatically excuse an infringement.")
+
+    if history:
+        recent = history.get("recent_penalties")
+        total = history.get("total_penalties")
+        if recent is not None and len(recent) >= RECENT_PENALTIES_THRESHOLD:
+            adjust(
+                "driver_history.recent_penalties",
+                len(recent),
+                RECENT_PENALTIES_DELTA,
+                "The supplied recent-history count increases the triage severity.",
+            )
+        if total is not None and total >= TOTAL_PENALTIES_THRESHOLD:
+            adjust(
+                "driver_history.total_penalties",
+                total,
+                TOTAL_PENALTIES_DELTA,
+                "The supplied long-term history increases the triage severity slightly.",
+            )
+
+    # The band is derived from the same rounded score that is reported.
+    severity = round(max(0.0, min(1.0, severity)), 3)
+
+    # Completeness of the inputs that can change this incident type's severity
+    # (track condition never does, so it is not counted).
+    supplied = {"driver_history": history is not None}
+    if incident in DRIVING_CONDUCT:
+        supplied["intent"] = intent_value is not Intent.UNKNOWN
+    confidence = 0.50 + 0.20 * sum(supplied.values()) / len(supplied)
+
+    return {
+        "triage_category": profile.outcome_category,
+        "severity_band": _severity_band(severity),
+        "severity_score": severity,
+        "severity_adjustments": adjustments,
+        "confidence": round(confidence, 3),
+        "confidence_basis": CONFIDENCE_BASIS,
+        "confidence_inputs": supplied,
+        "referenced_rule": None,
+        "reasoning": " ".join(reasoning),
+        "inputs": {
+            "incident_type": incident.value,
+            "track_condition": condition.value,
+            "intent": intent_value.value,
+            "driver_history": history,
+        },
+        "method": METHOD,
+        "disclaimer": DISCLAIMER,
+    }
+

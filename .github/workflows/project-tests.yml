@@ -28,8 +28,6 @@ jobs:
       - name: Compile Python source
         run: python -m compileall -q app core_modules scripts tests ui
       - name: Run the complete test suite
-        run: python -m pytest -q -rs
+        run: python -m pytest -q
       - name: Run the strategy example
         run: python -m core_modules.strategy_optimizer.example_usage
-      - name: Import the API the documented way
-        run: python -c "import app.main"

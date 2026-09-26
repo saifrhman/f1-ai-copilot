@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from itertools import combinations_with_replacement
 from numbers import Integral, Real
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -295,23 +295,64 @@ def _optional_list(name: str, value: Any, max_items: int) -> None:
         raise ValueError(f"{name} can contain at most {max_items} items")
 
 
+# Cross-field rules. The pydantic request schema calls these too, so each rule and its message exist
+# once; ``prefix`` is the location the engine adds (the schema reports it through pydantic's loc).
+
+
+def check_tire_key(key: TireCompound, compound: TireCompound) -> None:
+    if compound != key:
+        raise ValueError(f"tire_data key '{key.value}' does not match its compound '{compound.value}'")
+
+
+def check_peak_window_order(start: int, end: int, prefix: str = "") -> None:
+    if start > end:
+        raise ValueError(f"{prefix}peak_performance_window start ({start}) must be <= end ({end})")
+
+
+def check_lap_range(current_lap: int, total_laps: int, prefix: str = "") -> None:
+    if current_lap > total_laps:
+        raise ValueError(f"{prefix}current_lap ({current_lap}) must be <= total_laps ({total_laps})")
+
+
+def check_fitted_tyre_pair(compound: Optional[Any], tire_age: Optional[Any], prefix: str = "") -> None:
+    if (compound is None) != (tire_age is None):
+        raise ValueError(f"{prefix}current_compound and {prefix}current_tire_age must be given together")
+
+
+def check_current_compound_has_tire_data(
+    compound: Optional[TireCompound], tire_compounds: Collection[TireCompound]
+) -> None:
+    if compound is not None and compound not in tire_compounds:
+        raise ValueError(f"race_state.current_compound '{compound.value}' needs an entry in tire_data")
+
+
+def check_driver_value_supplied(name: str, measured: Optional[float], profile: Optional[float]) -> None:
+    """``name`` (one of ``DRIVER_OVERRIDE_KEYS``) must come from telemetry or from the driver profile."""
+
+    if measured is None and profile is None:
+        raise ValueError(f"{name} is required: supply telemetry.{name} or driver_profile.{name}")
+
+
+def check_unique_driver_ids(driver_ids: Sequence[str]) -> None:
+    seen = set()
+    for driver_id in driver_ids:
+        if driver_id in seen:
+            raise ValueError(f"Duplicate competitor driver_id '{driver_id}'")
+        seen.add(driver_id)
+
+
 def _validate_tire(key: Any, tire: Any) -> Tuple[TireCompound, TireData]:
     compound = _enum(TireCompound, "tire_data key", key)
     if not isinstance(tire, TireData):
         raise ValueError(f"tire_data[{compound.value}] must be TireData, got {type(tire).__name__}")
-    own = _enum(TireCompound, f"tire_data[{compound.value}].compound", tire.compound)
-    if own != compound:
-        raise ValueError(
-            f"tire_data key '{compound.value}' does not match its compound '{own.value}'"
-        )
+    check_tire_key(compound, _enum(TireCompound, f"tire_data[{compound.value}].compound", tire.compound))
     prefix = f"tire_data[{compound.value}]"
     window = tire.peak_performance_window
     if not isinstance(window, (list, tuple)) or len(window) != 2:
         raise ValueError(f"{prefix}.peak_performance_window must be a (start, end) pair of laps")
     start = _integer(f"{prefix}.peak_performance_window start", window[0], 1, MAX_TOTAL_LAPS)
     end = _integer(f"{prefix}.peak_performance_window end", window[1], 1, MAX_TOTAL_LAPS)
-    if start > end:
-        raise ValueError(f"{prefix}.peak_performance_window start ({start}) must be <= end ({end})")
+    check_peak_window_order(start, end, f"{prefix}.")
     clean = TireData(
         compound=compound,
         base_performance=_number(
@@ -421,8 +462,7 @@ def _validate_driver(
     used: List[float] = []
     for name, measured in zip(DRIVER_OVERRIDE_KEYS, (braking_override, throttle_override)):
         profile = _optional_number(f"driver_profile.{name}", getattr(driver, name), 0.0, 1.0)
-        if measured is None and profile is None:
-            raise ValueError(f"{name} is required: supply telemetry.{name} or driver_profile.{name}")
+        check_driver_value_supplied(name, measured, profile)
         used.append(measured if measured is not None else profile)
     return used[0], used[1]
 
@@ -433,16 +473,12 @@ def _validate_competition(competition: Any) -> List[Competitor]:
     if not isinstance(competition, (list, tuple)) or len(competition) > MAX_COMPETITORS:
         raise ValueError(f"competition must be a list of at most {MAX_COMPETITORS} competitors")
     clean: List[Competitor] = []
-    seen = set()
     for index, item in enumerate(competition):
         name = f"competition[{index}]"
         if not isinstance(item, Competitor):
             raise ValueError(f"{name} must be a Competitor")
         if not isinstance(item.driver_id, str) or not 1 <= len(item.driver_id.strip()) <= MAX_TEXT_LENGTH:
             raise ValueError(f"{name}.driver_id must be non-empty text of at most {MAX_TEXT_LENGTH} characters")
-        if item.driver_id in seen:
-            raise ValueError(f"Duplicate competitor driver_id '{item.driver_id}'")
-        seen.add(item.driver_id)
         if item.current_position is not None:
             _integer(f"{name}.current_position", item.current_position, 1, MAX_POSITION)
         if item.pit_stops_completed is not None:
@@ -458,6 +494,7 @@ def _validate_competition(competition: Any) -> List[Competitor]:
                 gap_to_leader=_number(f"{name}.gap_to_leader", item.gap_to_leader, 0.0, MAX_GAP_S),
             )
         )
+    check_unique_driver_ids([rival.driver_id for rival in clean])
     return clean
 
 
@@ -504,6 +541,16 @@ def _temperature_multiplier(track_temperature: float, compound: TireCompound) ->
     return 1.0
 
 
+def _warm_up_factor(tyre_laps: np.ndarray, warm_up_laps: int) -> np.ndarray:
+    """Share of peak performance per tyre lap: 90% rising linearly to 100% at ``warm_up_laps``, then 1."""
+
+    factor = np.ones(len(tyre_laps))
+    if warm_up_laps > 0:
+        warming = tyre_laps <= warm_up_laps
+        factor[warming] = 0.90 + 0.10 * tyre_laps[warming] / warm_up_laps
+    return factor
+
+
 def _performance_curve(
     tire: TireData, weather: WeatherCondition, track_temperature: float, laps: int
 ) -> np.ndarray:
@@ -512,9 +559,10 @@ def _performance_curve(
     tyre_lap = np.arange(1, laps + 1, dtype=float)
     base = tire.base_performance
     performance = base - np.maximum(0.0, tyre_lap - tire.peak_performance_window[1]) * tire.degradation_rate
-    if tire.warm_up_laps > 0:
-        warming = tyre_lap <= tire.warm_up_laps
-        performance[warming] = base * (0.90 + 0.10 * tyre_lap[warming] / tire.warm_up_laps)
+    # Warm-up laps follow the warm-up ramp instead (none when warm_up_laps is 0: tyre laps start at 1).
+    performance = np.where(
+        tyre_lap <= tire.warm_up_laps, base * _warm_up_factor(tyre_lap, tire.warm_up_laps), performance
+    )
     performance = performance * _weather_multiplier(weather, tire.compound)
     performance = performance * _temperature_multiplier(track_temperature, tire.compound)
     return np.maximum(performance, PERFORMANCE_FLOOR)
@@ -568,8 +616,7 @@ def _prepare(
     race = race_state
     total_laps = _integer("race_state.total_laps", race.total_laps, 1, MAX_TOTAL_LAPS)
     current_lap = _integer("race_state.current_lap", race.current_lap, 1, MAX_TOTAL_LAPS)
-    if current_lap > total_laps:
-        raise ValueError(f"race_state.current_lap ({current_lap}) must be <= total_laps ({total_laps})")
+    check_lap_range(current_lap, total_laps, "race_state.")
     weather = _enum(WeatherCondition, "race_state.weather", race.weather)
     track_temperature = _number(
         "race_state.track_temperature", race.track_temperature, MIN_TRACK_TEMPERATURE_C, MAX_TRACK_TEMPERATURE_C
@@ -579,17 +626,13 @@ def _prepare(
     _optional_list("race_state.weather_forecast", race.weather_forecast, MAX_LIST_ITEMS)
     _optional_number("race_state.own_gap_to_leader", race.own_gap_to_leader, 0.0, MAX_GAP_S)
 
-    if (race.current_compound is None) != (race.current_tire_age is None):
-        raise ValueError("race_state.current_compound and race_state.current_tire_age must be given together")
+    check_fitted_tyre_pair(race.current_compound, race.current_tire_age, "race_state.")
     current_compound: Optional[TireCompound] = None
     current_tire_age: Optional[int] = None
     if race.current_compound is not None:
         current_compound = _enum(TireCompound, "race_state.current_compound", race.current_compound)
         current_tire_age = _integer("race_state.current_tire_age", race.current_tire_age, 0, MAX_TIRE_AGE_LAPS)
-        if current_compound not in tires:
-            raise ValueError(
-                f"race_state.current_compound '{current_compound.value}' needs an entry in tire_data"
-            )
+        check_current_compound_has_tire_data(current_compound, tires)
 
     used: Optional[FrozenSet[TireCompound]] = None
     if race.used_compounds is not None:

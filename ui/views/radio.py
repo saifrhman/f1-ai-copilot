@@ -9,33 +9,21 @@ import streamlit as st
 
 from ui.api_client import ApiError, ApiUnavailable, get_client
 from ui.components import (
-    ACOUSTIC_CONFIDENCE_RULE,
-    AUDIO_TYPES,
-    MAX_AUDIO_BYTES,
-    cached_health,
+    CLIP_SOURCES,
+    MAX_AUDIO_TEXT,
+    UPLOAD,
+    clip_input,
     heuristic_badge,
+    humanise,
     json_expander,
     md_text,
+    oversize_problem,
     profile_tie_note,
     show_api_error,
+    transcription_state,
 )
 
 RESULT_KEY = "radio_result"
-UPLOAD, RECORD = "Upload a file", "Record"
-MAX_CONFIDENCE = 0.95
-
-COMBINATION_RULES = {
-    "acoustic_only": "The acoustic label is used: there was no transcript, or its keywords were neutral or tied.",
-    "text_agrees": "Transcript keywords agree with the acoustic label; confidence = min(0.95, max(acoustic, text) + 0.10).",
-    "text_overrides_acoustic": (
-        "Transcript keywords (at least 2 more hits for one emotion than for any other, and a higher score) override "
-        "the acoustic label; confidence = text - acoustic / 2."
-    ),
-    "acoustic_kept_text_disagrees": (
-        "The transcript points to another emotion but too weakly (e.g. a single keyword), so the acoustic label is "
-        "kept; confidence = acoustic - text / 2."
-    ),
-}
 # (label, unit, frames covered) per API feature; only the first four feed the emotion profiles.
 FEATURES = {
     "mean_pitch": ("Mean pitch", "Hz", "voiced frames"),
@@ -53,21 +41,6 @@ FEATURES = {
     "duration": ("Duration", "s", "whole clip"),
 }
 PROFILE_FEATURES = ("mean_pitch", "pitch_std", "rms_energy", "energy_std")
-
-
-def transcription_state() -> Dict[str, Any]:
-    """``{"available": True/False/None, "reason": str}`` from /health (None: the check failed)."""
-
-    try:
-        health = cached_health()
-    except (ApiUnavailable, ApiError) as exc:
-        reason = exc.reason if isinstance(exc, ApiUnavailable) else exc.detail
-        return {"available": None, "reason": f"the API status check failed ({reason})"}
-    state = (health.get("modules") or {}).get("emotion_transcription")
-    return {
-        "available": state == "ready",
-        "reason": (health.get("details") or {}).get("emotion_transcription") or "no reason given",
-    }
 
 
 def render_transcription_notice(state: Dict[str, Any]) -> None:
@@ -111,9 +84,9 @@ def render_transcript(body: Dict[str, Any]) -> None:
 
 
 def acoustic_breakdown(body: Dict[str, Any], scores: List[Tuple[str, float]]) -> str:
-    """How the API scored the acoustic label, with the similarities it used."""
+    """How the API scored the acoustic label (its ``acoustic_confidence_rule``), with the similarities it used."""
 
-    text = f"Acoustic confidence {body['acoustic_confidence']:.3f} = {ACOUSTIC_CONFIDENCE_RULE}."
+    text = f"Acoustic confidence {body['acoustic_confidence']:.3f} = {md_text(body.get('acoustic_confidence_rule'))}."
     if len(scores) > 1:
         (best, best_score), (runner_up, runner_up_score) = scores[0], scores[1]
         text += (
@@ -134,7 +107,7 @@ def render_result(result: Dict[str, Any]) -> None:
     columns[1].metric(
         "Confidence",
         f"{body['confidence']:.3f}",
-        help=f"Heuristic score (0 to {MAX_CONFIDENCE}), not a probability; the combination rule below says how it was computed",
+        help="Heuristic score, not a probability; the combination rule below says how it was computed",
     )
     columns[2].metric(  # the confidence as the delta line: label and number in one value are cut off
         "Acoustic label",
@@ -143,7 +116,8 @@ def render_result(result: Dict[str, Any]) -> None:
         delta_color="off",
         delta_arrow="off",
         delta_description="acoustic confidence",
-        help=f"Label and acoustic confidence from the pitch and energy profiles alone: {ACOUSTIC_CONFIDENCE_RULE}",
+        help="Label and acoustic confidence from the pitch and energy profiles alone: "
+        + md_text(body.get("acoustic_confidence_rule")),
     )
     columns[3].metric("Duration", f"{body['duration']:.1f} s", help=f"Submitted at {body['source_sample_rate']} Hz")
     tie = profile_tie_note(body.get("acoustic_profile_scores") or {}, body.get("acoustic_emotion"))
@@ -157,7 +131,7 @@ def render_result(result: Dict[str, Any]) -> None:
     )
     st.caption(
         f"Confidence is {basis}: a heuristic score, not the probability that the driver feels this way. "
-        f"**Combination rule:** {md_text(COMBINATION_RULES.get(combination, combination))}"
+        f"**Combination rule:** {md_text(body.get('evidence_combination_rule') or combination)}"
     )
     st.caption(acoustic_breakdown(body, scores))
 
@@ -175,7 +149,7 @@ def render_result(result: Dict[str, Any]) -> None:
     st.markdown("**Acoustic features**")
     rows = []
     for key, value in (body.get("audio_features") or {}).items():
-        name, unit, frames = FEATURES.get(key, (key.replace("_", " "), "", ""))
+        name, unit, frames = FEATURES.get(key, (humanise(key), "", ""))
         rows.append(
             {
                 "Feature": name,
@@ -201,8 +175,8 @@ st.markdown(
     "coarse label for exploring radio clips, **not a validated emotion model**."
 )
 st.caption(
-    "Clips: 0.5-120 s of speech, mono or stereo, 8-96 kHz, at most 20 MiB. WAV, FLAC, OGG and MP3 are decoded "
-    "natively; M4A and WebM need ffmpeg where the API runs. Silent or noise-only clips are rejected, not labelled."
+    f"Clips: 0.5-120 s of speech, mono or stereo, 8-96 kHz, at most {MAX_AUDIO_TEXT}. WAV, FLAC, OGG and MP3 are "
+    "decoded natively; M4A and WebM need ffmpeg where the API runs. Silent or noise-only clips are rejected, not labelled."
 )
 st.caption(
     "**Labels depend on recording level:** the energy bands are absolute, so the same speech recorded louder or "
@@ -211,16 +185,9 @@ st.caption(
 transcription = transcription_state()
 render_transcription_notice(transcription)
 
-source = st.segmented_control("Clip", [UPLOAD, RECORD], default=UPLOAD, required=True, key="radio_source")
+source = st.segmented_control("Clip", CLIP_SOURCES, default=UPLOAD, required=True, key="radio_source")
 with st.form("radio_form"):
-    if source == UPLOAD:
-        clip = st.file_uploader("Radio clip", type=AUDIO_TYPES, key="radio_file")
-    else:
-        clip = st.audio_input(
-            "Record a clip",
-            key="radio_recording",
-            help="Browsers allow the microphone only on localhost or HTTPS pages.",
-        )
+    clip = clip_input(source, "radio")
     transcribe = st.toggle(
         "Transcribe with Whisper",
         disabled=transcription["available"] is False,
@@ -234,12 +201,8 @@ if submitted:
     audio: Optional[bytes] = clip.getvalue() if clip is not None else None
     if not audio:
         st.warning("Upload or record a clip first.", icon=":material/mic:")
-    elif len(audio) > MAX_AUDIO_BYTES:
-        st.error(
-            f"The clip is {len(audio) / 2**20:.1f} MiB; the API accepts at most {MAX_AUDIO_BYTES // 2**20} MiB. "
-            "Nothing was sent: trim the clip or save it in a compressed format (FLAC, OGG or MP3).",
-            icon=":material/data_alert:",
-        )
+    elif too_large := oversize_problem(audio):
+        st.error(f"Nothing was sent to the API. {too_large}", icon=":material/data_alert:")
     else:
         try:
             with st.spinner("Analysing the clip..."):
