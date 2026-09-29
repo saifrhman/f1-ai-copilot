@@ -2,7 +2,7 @@
 #
 #   mkdir -p data/fia_docs .cache outputs     # bind-mounted below; create them before the first run
 #   docker compose up -d --build              # UI http://127.0.0.1:8501, API http://127.0.0.1:8000/docs
-#   docker compose run --rm api python scripts/fetch_fia_regulations.py
+#   docker compose run --rm api python scripts/fetch_fia_regulations.py       # optional: newer issues than the included PDFs
 #   docker compose run --rm api python scripts/build_fia_index.py --dry-run   # then without --dry-run
 #   docker compose up -d api                  # apply .env changes (`restart` keeps the old settings)
 #   docker compose down                       # stop (add -v to delete the stored index)

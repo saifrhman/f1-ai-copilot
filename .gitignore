@@ -27,8 +27,13 @@ htmlcov/
 *.onnx
 *.zip
 
-# Raw third-party data and generated output
-data/
+# Raw third-party data and generated output. The official FIA regulation PDFs in
+# data/fia_docs are included (README: "Acknowledgements"); the downloader's
+# staging files are not.
+data/*
+!data/fia_docs/
+data/fia_docs/.download-*/
+data/fia_docs/.manifest-*
 outputs/
 
 # OS/editor noise

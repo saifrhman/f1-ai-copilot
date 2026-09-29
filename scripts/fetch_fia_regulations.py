@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Download the current official FIA Formula 1 regulation PDFs for local RAG use.
 
-The FIA website terms reserve copyright in FIA Publications and limit copying to
-private/non-commercial use unless FIA gives prior written consent. For that
-reason this script downloads files into the git-ignored data/fia_docs directory
-and the project does not redistribute the PDFs.
+The regulations are FIA Publications: the FIA keeps their copyright. The
+repository includes unmodified copies of the issues listed in
+data/fia_docs/manifest.json, credited to the FIA in the README
+("Acknowledgements"); this script replaces them with the newest issues.
 
 The FIA category page lists every historical issue of each section. For each
 requested section the script selects the newest issue (by the date and issue
@@ -228,8 +228,8 @@ def fetch_regulations(
         "year": year,
         "official_category": category_response.url,
         "usage_note": (
-            "Downloaded directly from FIA for local/private project use. "
-            "Do not redistribute these FIA Publications without the rights holder's permission."
+            "Official FIA Publications, downloaded unmodified from fia.com. The FIA keeps their copyright; "
+            "the current issues are published at official_category."
         ),
         "documents": entries,
     }

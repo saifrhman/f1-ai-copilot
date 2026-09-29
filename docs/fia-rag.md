@@ -41,7 +41,7 @@ What each setting affects:
 
 ## 1. Download the regulations
 
-The FIA PDFs are third-party copyrighted material and are not in this repository (`data/` is git-ignored). For local/private use:
+The FIA PDFs are third-party copyrighted material: the FIA keeps their copyright. The repository includes unmodified copies of the issues listed in `data/fia_docs/manifest.json`, credited to the FIA in the README's [Acknowledgements](../README.md#acknowledgements). To replace them with the newest official issues:
 
 ```bash
 python scripts/fetch_fia_regulations.py --dry-run   # show what would be downloaded

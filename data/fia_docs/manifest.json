@@ -1,0 +1,108 @@
+{
+  "generated_at": "2026-09-29T21:55:07.396616+00:00",
+  "year": 2026,
+  "official_category": "https://www.fia.com/regulation/category/2182",
+  "usage_note": "Official FIA Publications, downloaded unmodified from fia.com. The FIA keeps their copyright; the current issues are published at official_category.",
+  "documents": [
+    {
+      "section": "A",
+      "year": 2026,
+      "issue": 3,
+      "issue_date": "2026-06-25",
+      "source_category": "https://www.fia.com/regulation/category/2182",
+      "source_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_a_general_provisions_-_iss_03_-_2026-06-25.pdf",
+      "filename": "fia_2026_f1_regulations_-_section_a_general_provisions_-_iss_03_-_2026-06-25.pdf",
+      "superseded_issues_on_page": [],
+      "download_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_a_general_provisions_-_iss_03_-_2026-06-25.pdf",
+      "bytes": 972269,
+      "pages": 84,
+      "sha256": "6ce8c9420ddb8194e1b5ea8f678dbbdcb4bb2094780e636324b709ee70d276d6"
+    },
+    {
+      "section": "B",
+      "year": 2026,
+      "issue": 8,
+      "issue_date": "2026-08-05",
+      "source_category": "https://www.fia.com/regulation/category/2182",
+      "source_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_b_sporting_-_iss_08_-_2026-08-05_7.pdf",
+      "filename": "fia_2026_f1_regulations_-_section_b_sporting_-_iss_08_-_2026-08-05_7.pdf",
+      "superseded_issues_on_page": [
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_b_sporting_-_iss03_-_2025-07-31.pdf",
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_b_sporting_-_iss_05_-_2026-02-27.pdf"
+      ],
+      "download_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_b_sporting_-_iss_08_-_2026-08-05_7.pdf",
+      "bytes": 1328277,
+      "pages": 98,
+      "sha256": "cbe329807d7803a4db511f80d829de1212d0c6a1c3b327cddb1b841823baa9fd"
+    },
+    {
+      "section": "C",
+      "year": 2026,
+      "issue": 20,
+      "issue_date": "2026-08-05",
+      "source_category": "https://www.fia.com/regulation/category/2182",
+      "source_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_c_technical_-_iss_20_-_2026-08-05.pdf",
+      "filename": "fia_2026_f1_regulations_-_section_c_technical_-_iss_20_-_2026-08-05.pdf",
+      "superseded_issues_on_page": [
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_c_technical_-_iss_14_-_2025-10-16.pdf",
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_c_technical_-_iss_16_-_2026-02-27.pdf"
+      ],
+      "download_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_c_technical_-_iss_20_-_2026-08-05.pdf",
+      "bytes": 5825714,
+      "pages": 254,
+      "sha256": "cf0b919eef5eecc27497fb6de012f8d27e200f6dbd34d62b7e5385f7274ff652"
+    },
+    {
+      "section": "D",
+      "year": 2026,
+      "issue": 7,
+      "issue_date": "2026-06-25",
+      "source_category": "https://www.fia.com/regulation/category/2182",
+      "source_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_d_financial_-_f1_teams_-_iss_07_-_2026-06-25.pdf",
+      "filename": "fia_2026_f1_regulations_-_section_d_financial_-_f1_teams_-_iss_07_-_2026-06-25.pdf",
+      "superseded_issues_on_page": [
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_d_financial_-_f1_teams_-_iss_05_-_2026-02-27.pdf",
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_d_financial_regulations_-_f1_teams_-_iss_03-_2025-06-10.pdf"
+      ],
+      "download_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_d_financial_-_f1_teams_-_iss_07_-_2026-06-25.pdf",
+      "bytes": 762381,
+      "pages": 64,
+      "sha256": "b38f5a1b2c67edbe3c86e4f7d4adbfce6321504f8733a70201508b99ed4717b5"
+    },
+    {
+      "section": "E",
+      "year": 2026,
+      "issue": 6,
+      "issue_date": "2026-06-25",
+      "source_category": "https://www.fia.com/regulation/category/2182",
+      "source_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_e_financial_-_pu_manufacturers_-_iss_06_-_2026-06-25.pdf",
+      "filename": "fia_2026_f1_regulations_-_section_e_financial_-_pu_manufacturers_-_iss_06_-_2026-06-25.pdf",
+      "superseded_issues_on_page": [
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_e_financial_regulations_-_power_unit_manufacturers_-_iss_03_-_2025-12-10_0.pdf",
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_e_financial_regulations_-_power_unit_manufacturers_-_iss_2_-_2025-10-16.pdf"
+      ],
+      "download_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_e_financial_-_pu_manufacturers_-_iss_06_-_2026-06-25.pdf",
+      "bytes": 886424,
+      "pages": 60,
+      "sha256": "7fed64aae631c008bc31669bf32e0d9d102bf416f08da48a240b72f5ee1bd658"
+    },
+    {
+      "section": "F",
+      "year": 2026,
+      "issue": 10,
+      "issue_date": "2026-08-05",
+      "source_category": "https://www.fia.com/regulation/category/2182",
+      "source_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_f_operational_-_iss_10_-_2026-08-05.pdf",
+      "filename": "fia_2026_f1_regulations_-_section_f_operational_-_iss_10_-_2026-08-05.pdf",
+      "superseded_issues_on_page": [
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_f_operational_-_iss_04_-_2025-10-17_0.pdf",
+        "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_f_operational_-_iss_06_-_2026-02-27.pdf"
+      ],
+      "download_url": "https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_f_operational_-_iss_10_-_2026-08-05.pdf",
+      "bytes": 492202,
+      "pages": 32,
+      "sha256": "c53c9f07e6313d0c0a0263204d745ba1f99e8c496286924a2166bc66dac38845"
+    }
+  ],
+  "removed_superseded_files": []
+}

@@ -4,6 +4,8 @@ F1 AI Copilot is a Formula 1 analysis API built with FastAPI, with a Streamlit w
 
 It is a research/demo project, not an FIA steward tool, a validated vehicle-dynamics simulator or a production race-engineering system. Everything heuristic is labelled as such in the code, in API responses and in the UI.
 
+The regulation PDFs it answers from are the FIA's own publications, included with thanks and full citations; see [Acknowledgements](#acknowledgements).
+
 To use it in your browser on your own computer, see [Run it on your own computer](#run-it-on-your-own-computer); the pages are explained in [docs/ui.md](docs/ui.md).
 
 ![FIA regulations page: passage search over the indexed 2026 regulations](docs/images/ui-regulations-search.png)
@@ -53,7 +55,7 @@ The project runs as two programs on your computer: the API (port 8000) and a web
 | Page | Needs |
 | --- | --- |
 | Race strategy, Car setup, Ghost car, Driver radio, Incident triage, Ask the copilot (non-rule questions) | Only the installation below |
-| FIA regulations (and rule questions on Ask the copilot) | A model-provider API key, the regulation PDFs and a one-time index build (step 4) |
+| FIA regulations (and rule questions on Ask the copilot) | A model-provider API key and a one-time index build (step 4); the regulation PDFs are included |
 | Radio transcription | Optional: Whisper and ffmpeg |
 
 ### 1. Prerequisites
@@ -134,19 +136,20 @@ The similarity threshold (`FIA_RAG_MIN_SCORE=0.30`) was calibrated for the OpenR
 
 **b. Stop the app (Ctrl+C) if it is running.** The index storage can be opened by only one program at a time.
 
-**c. Download the regulations and build the index:**
+**c. Build the index.** The official 2026 regulation PDFs are included in `data/fia_docs` (see [Acknowledgements](#acknowledgements)):
 
 ```bash
-python scripts/fetch_fia_regulations.py        # latest official PDFs from fia.com into data/fia_docs
 python scripts/build_fia_index.py --dry-run    # no provider requests: prints the chunk count and the requests needed
 python scripts/build_fia_index.py              # embeds the passages and builds the index
 ```
+
+To use newer issues than the included ones, run `python scripts/fetch_fia_regulations.py` first. It downloads the latest official PDFs from fia.com into `data/fia_docs` and removes the issues they supersede.
 
 The six 2026 PDFs give 1,938 passages, about 431,000 tokens. That is 8 embedding requests at batch size 256, or 16 at the default 128. Parsing takes about a minute. The dry run needs no key.
 
 The embeddings are cached in `.cache/`. Running the build again for unchanged documents reports `up_to_date` and makes no requests.
 
-The PDFs are FIA publications, for private, non-commercial use. They are not part of this repository.
+The PDFs are FIA Publications, and the FIA keeps their copyright. [Acknowledgements](#acknowledgements) lists their sources and how to cite them.
 
 **d. Start again** with `python scripts/run_app.py`. The Overview should now show the regulation QA as `ready`.
 
@@ -182,7 +185,7 @@ This needs Docker Desktop (Windows, macOS), or Docker Engine with Compose 2.24 o
 mkdir -p data/fia_docs .cache outputs
 cp .env.example .env                                # add a key as in step 4a for the regulation Q&A
 docker compose up -d --build --wait                 # UI http://127.0.0.1:8501, API http://127.0.0.1:8000/docs
-docker compose run --rm api python scripts/fetch_fia_regulations.py
+docker compose run --rm api python scripts/fetch_fia_regulations.py   # optional: newer issues than the included PDFs
 docker compose run --rm api python scripts/build_fia_index.py --dry-run
 docker compose run --rm api python scripts/build_fia_index.py
 ```
@@ -361,6 +364,7 @@ scripts/
   build_fia_index.py                 index build / dry run
   check_fia_rag.py                   end-to-end evaluation and threshold calibration (+ fia_rag_eval_questions.json)
   check_whisper.py                   real Whisper transcription check
+data/fia_docs/                       official FIA regulation PDFs + manifest.json (see Acknowledgements)
 tests/                               pytest suite (python -m pytest -q)
 docs/fia-rag.md                      RAG design, operation and evaluation
 docs/ui.md                           web UI guide (pages, results, troubleshooting)
@@ -370,4 +374,26 @@ Dockerfile, docker-compose.yml       container image; Compose stack with the API
 
 ## Licensing
 
-This repository does not include a license file. The FIA regulation PDFs are FIA Publications: FIA's website terms reserve their copyright and allow private, non-commercial copies. They are downloaded by the helper script for local use, are git-ignored and are not redistributed here.
+This repository does not include a license file. The FIA regulation PDFs in `data/fia_docs/` are FIA Publications: the FIA keeps their copyright, and they are included unmodified with attribution (see [Acknowledgements](#acknowledgements)).
+
+## Acknowledgements
+
+Thank you to the **Fédération Internationale de l'Automobile (FIA)**, which writes the Formula 1 Regulations and publishes them on [fia.com](https://www.fia.com/regulation/category/2182). The regulation Q&A, its evaluation and every answer it gives are built on these documents.
+
+This repository includes unmodified copies of the six sections of the 2026 Formula 1 Regulations in [`data/fia_docs/`](data/fia_docs/), so the project can be set up without a separate download. [`manifest.json`](data/fia_docs/manifest.json) records each file's official URL, page count and SHA-256.
+
+| Section | Title | Issue | Date | Pages | Official PDF |
+| --- | --- | --- | --- | --- | --- |
+| A | General Regulatory Provisions | 03 | 25 June 2026 | 84 | [fia.com](https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_a_general_provisions_-_iss_03_-_2026-06-25.pdf) |
+| B | Sporting Regulations | 08 | 5 August 2026 | 98 | [fia.com](https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_b_sporting_-_iss_08_-_2026-08-05_7.pdf) |
+| C | Technical Regulations | 20 | 5 August 2026 | 254 | [fia.com](https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_c_technical_-_iss_20_-_2026-08-05.pdf) |
+| D | Financial Regulations (F1 Teams) | 07 | 25 June 2026 | 64 | [fia.com](https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_d_financial_-_f1_teams_-_iss_07_-_2026-06-25.pdf) |
+| E | Financial Regulations (Power Unit Manufacturers) | 06 | 25 June 2026 | 60 | [fia.com](https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_e_financial_-_pu_manufacturers_-_iss_06_-_2026-06-25.pdf) |
+| F | Operational Regulations | 10 | 5 August 2026 | 32 | [fia.com](https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_f_operational_-_iss_10_-_2026-08-05.pdf) |
+
+To cite one of them, for example: Fédération Internationale de l'Automobile (2026). *2026 Formula 1 Regulations, Section B: Sporting Regulations*, Issue 08, 5 August 2026. <https://www.fia.com/system/files/documents/fia_2026_f1_regulations_-_section_b_sporting_-_iss_08_-_2026-08-05_7.pdf>
+
+* **Copyright:** the documents are © 2026 Fédération Internationale de l'Automobile, and the FIA keeps the copyright. They are included for non-commercial research and educational use.
+* **Not official:** this is an independent project, not affiliated with, endorsed by or sponsored by the FIA or Formula 1. Its answers are not official interpretations of the regulations; the official, current issues are the ones on fia.com.
+* **Updates:** the FIA revises the regulations during the season. `python scripts/fetch_fia_regulations.py` replaces the copies here with the newest issues (see [Stop, update, rebuild](#stop-update-rebuild)).
+* **Removal:** if you represent the FIA and would like these copies removed, please open an issue and they will be taken down.
